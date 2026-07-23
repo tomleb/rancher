@@ -1,0 +1,100 @@
+package server
+
+import (
+	"github.com/rancher/webhook/pkg/admission"
+	"github.com/rancher/webhook/pkg/clients"
+	v3 "github.com/rancher/webhook/pkg/generated/controllers/management.cattle.io/v3"
+	"github.com/rancher/webhook/pkg/resolvers"
+	"github.com/rancher/webhook/pkg/resources/catalog.cattle.io/v1/clusterrepo"
+	nshandler "github.com/rancher/webhook/pkg/resources/core/v1/namespace"
+	"github.com/rancher/webhook/pkg/resources/core/v1/secret"
+	managementCluster "github.com/rancher/webhook/pkg/resources/management.cattle.io/v3/cluster"
+	"github.com/rancher/webhook/pkg/resources/management.cattle.io/v3/clusterproxyconfig"
+	"github.com/rancher/webhook/pkg/resources/management.cattle.io/v3/clusterroletemplatebinding"
+	"github.com/rancher/webhook/pkg/resources/management.cattle.io/v3/feature"
+	"github.com/rancher/webhook/pkg/resources/management.cattle.io/v3/fleetworkspace"
+	"github.com/rancher/webhook/pkg/resources/management.cattle.io/v3/globalrole"
+	"github.com/rancher/webhook/pkg/resources/management.cattle.io/v3/globalrolebinding"
+	"github.com/rancher/webhook/pkg/resources/management.cattle.io/v3/nodedriver"
+	"github.com/rancher/webhook/pkg/resources/management.cattle.io/v3/podsecurityadmissionconfigurationtemplate"
+	"github.com/rancher/webhook/pkg/resources/management.cattle.io/v3/project"
+	"github.com/rancher/webhook/pkg/resources/management.cattle.io/v3/projectroletemplatebinding"
+	"github.com/rancher/webhook/pkg/resources/management.cattle.io/v3/roletemplate"
+	"github.com/rancher/webhook/pkg/resources/management.cattle.io/v3/setting"
+	"github.com/rancher/webhook/pkg/resources/management.cattle.io/v3/userattribute"
+	provisioningCluster "github.com/rancher/webhook/pkg/resources/provisioning.cattle.io/v1/cluster"
+	"github.com/rancher/webhook/pkg/resources/rbac.authorization.k8s.io/v1/clusterrole"
+	"github.com/rancher/webhook/pkg/resources/rbac.authorization.k8s.io/v1/clusterrolebinding"
+	"github.com/rancher/webhook/pkg/resources/rbac.authorization.k8s.io/v1/role"
+	"github.com/rancher/webhook/pkg/resources/rbac.authorization.k8s.io/v1/rolebinding"
+	"github.com/rancher/webhook/pkg/resources/rke-machine-config.cattle.io/v1/machineconfig"
+)
+
+// Validation returns a list of all ValidatingAdmissionHandlers used by the webhook.
+func Validation(clients *clients.Clients) ([]admission.ValidatingAdmissionHandler, error) {
+
+	var userCache v3.UserCache
+	if clients.MultiClusterManagement {
+		userCache = clients.Management.User().Cache()
+	}
+	clusters := managementCluster.NewValidator(
+		clients.K8s.AuthorizationV1().SubjectAccessReviews(),
+		clients.Management.PodSecurityAdmissionConfigurationTemplate().Cache(),
+		userCache,
+	)
+
+	handlers := []admission.ValidatingAdmissionHandler{
+		feature.NewValidator(),
+		clusters,
+		provisioningCluster.NewProvisioningClusterValidator(clients),
+		machineconfig.NewValidator(),
+		nshandler.NewValidator(clients.K8s.AuthorizationV1().SubjectAccessReviews()),
+	}
+
+	if clients.MultiClusterManagement {
+		clusterProxyConfigs := clusterproxyconfig.NewValidator(clients.Management.ClusterProxyConfig().Cache())
+		crtbResolver := resolvers.NewCRTBRuleResolver(clients.Management.ClusterRoleTemplateBinding().Cache(), clients.RoleTemplateResolver)
+		prtbResolver := resolvers.NewPRTBRuleResolver(clients.Management.ProjectRoleTemplateBinding().Cache(), clients.RoleTemplateResolver)
+		grbResolvers := resolvers.NewGRBRuleResolvers(clients.Management.GlobalRoleBinding().Cache(), clients.GlobalRoleResolver)
+		psact := podsecurityadmissionconfigurationtemplate.NewValidator(clients.Management.Cluster().Cache(), clients.Provisioning.Cluster().Cache())
+		globalRoles := globalrole.NewValidator(clients.DefaultResolver, grbResolvers, clients.K8s.AuthorizationV1().SubjectAccessReviews(), clients.GlobalRoleResolver)
+		globalRoleBindings := globalrolebinding.NewValidator(clients.DefaultResolver, grbResolvers, clients.K8s.AuthorizationV1().SubjectAccessReviews(), clients.GlobalRoleResolver)
+		prtbs := projectroletemplatebinding.NewValidator(prtbResolver, crtbResolver, clients.DefaultResolver, clients.RoleTemplateResolver, clients.Management.Cluster().Cache(), clients.Management.Project().Cache())
+		crtbs := clusterroletemplatebinding.NewValidator(crtbResolver, clients.DefaultResolver, clients.RoleTemplateResolver, clients.Management.GlobalRoleBinding().Cache(), clients.Management.Cluster().Cache())
+		roleTemplates := roletemplate.NewValidator(clients.DefaultResolver, clients.RoleTemplateResolver, clients.K8s.AuthorizationV1().SubjectAccessReviews(), clients.Management.GlobalRole().Cache())
+		secrets := secret.NewValidator(clients.RBAC.Role().Cache(), clients.RBAC.RoleBinding().Cache())
+		nodeDriver := nodedriver.NewValidator(clients.Management.Node().Cache(), clients.Dynamic)
+		projects := project.NewValidator(clients.Management.Cluster().Cache(), clients.Management.User().Cache())
+		roles := role.NewValidator()
+		rolebindings := rolebinding.NewValidator()
+		setting := setting.NewValidator(clients.Management.Cluster().Cache(), clients.Management.Setting().Cache())
+		userAttribute := userattribute.NewValidator()
+		clusterRoles := clusterrole.NewValidator()
+		clusterRoleBindings := clusterrolebinding.NewValidator()
+
+		handlers = append(handlers, psact, globalRoles, globalRoleBindings, prtbs, crtbs, roleTemplates, secrets, nodeDriver, projects, roles, rolebindings, clusterRoles, clusterRoleBindings, clusterProxyConfigs, userAttribute, setting)
+	}
+
+	clusterrepo := clusterrepo.NewValidator()
+	handlers = append(handlers, clusterrepo)
+
+	return handlers, nil
+}
+
+// Mutation returns a list of all MutatingAdmissionHandlers used by the webhook.
+func Mutation(clients *clients.Clients) ([]admission.MutatingAdmissionHandler, error) {
+	mutators := []admission.MutatingAdmissionHandler{
+		provisioningCluster.NewProvisioningClusterMutator(clients.Core.Secret(), clients.Management.PodSecurityAdmissionConfigurationTemplate().Cache()),
+		managementCluster.NewManagementClusterMutator(clients.Management.PodSecurityAdmissionConfigurationTemplate().Cache()),
+		fleetworkspace.NewMutator(clients),
+		&machineconfig.Mutator{},
+	}
+
+	if clients.MultiClusterManagement {
+		secrets := secret.NewMutator(clients.RBAC.Role(), clients.RBAC.RoleBinding())
+		projects := project.NewMutator(clients.Management.RoleTemplate().Cache())
+		grbs := globalrolebinding.NewMutator(clients.Management.GlobalRole().Cache())
+		mutators = append(mutators, secrets, projects, grbs)
+	}
+	return mutators, nil
+}

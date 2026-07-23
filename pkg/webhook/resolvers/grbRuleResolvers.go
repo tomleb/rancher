@@ -1,11 +1,12 @@
 package resolvers
 
 import (
+	"context"
 	"fmt"
 
 	apisv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
-	"github.com/rancher/webhook/pkg/auth"
-	v3 "github.com/rancher/webhook/pkg/generated/controllers/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/webhook/auth"
+	v3 "github.com/rancher/rancher/pkg/generated/controllers/management.cattle.io/v3"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apiserver/pkg/authentication/user"
 )
@@ -80,28 +81,28 @@ func NewGRBRuleResolvers(grbCache v3.GlobalRoleBindingCache, grResolver *auth.Gl
 
 // GetRoleReferenceRules is used to find which rules are granted by a rolebinding/clusterRoleBinding. Since we don't
 // use these primitives to refer to the globalRoles, this function returns an empty slice.
-func (g *GRBRuleResolver) GetRoleReferenceRules(rbacv1.RoleRef, string) ([]rbacv1.PolicyRule, error) {
+func (g *GRBRuleResolver) GetRoleReferenceRules(context.Context, rbacv1.RoleRef, string) ([]rbacv1.PolicyRule, error) {
 	return []rbacv1.PolicyRule{}, nil
 }
 
 // RulesFor returns the list of Cluster rules that apply in a given namespace (usually either the namespace of a
 // specific cluster or "" for all clusters). If an error is returned, the slice of PolicyRules may not be complete,
 // but contains all retrievable rules.
-func (g *GRBRuleResolver) RulesFor(user user.Info, namespace string) ([]rbacv1.PolicyRule, error) {
+func (g *GRBRuleResolver) RulesFor(ctx context.Context, user user.Info, namespace string) ([]rbacv1.PolicyRule, error) {
 	visitor := &ruleAccumulator{}
-	g.visitRulesForWithRuleResolver(user, namespace, visitor.visit, g.ruleResolver)
+	g.visitRulesForWithRuleResolver(ctx, user, namespace, visitor.visit, g.ruleResolver)
 	return visitor.rules, visitor.getError()
 }
 
 // VisitRulesFor invokes visitor() with each rule that applies to a given user in a given namespace, and each error encountered resolving those rules.
 // If visitor() returns false, visiting is short-circuited. This will return different rules for the "local" namespace.
-func (g *GRBRuleResolver) VisitRulesFor(user user.Info, namespace string, visitor func(source fmt.Stringer, rule *rbacv1.PolicyRule, err error) bool) {
-	g.visitRulesForWithRuleResolver(user, namespace, visitor, g.ruleResolver)
+func (g *GRBRuleResolver) VisitRulesFor(ctx context.Context, user user.Info, namespace string, visitor func(source fmt.Stringer, rule *rbacv1.PolicyRule, err error) bool) {
+	g.visitRulesForWithRuleResolver(ctx, user, namespace, visitor, g.ruleResolver)
 }
 
 // visitRulesForWithRuleResolver invokes visitor() with each rule that applies to a given user in a given namespace, and each error encountered resolving those rules.
 // If visitor() returns false, visiting is short-circuited. This will return different rules for the "local" namespace.
-func (g *GRBRuleResolver) visitRulesForWithRuleResolver(user user.Info, namespace string, visitor func(source fmt.Stringer, rule *rbacv1.PolicyRule, err error) bool, ruleResolver func(namespace string, gr *apisv3.GlobalRole, grResolver *auth.GlobalRoleResolver) ([]rbacv1.PolicyRule, error)) {
+func (g *GRBRuleResolver) visitRulesForWithRuleResolver(_ context.Context, user user.Info, namespace string, visitor func(source fmt.Stringer, rule *rbacv1.PolicyRule, err error) bool, ruleResolver func(namespace string, gr *apisv3.GlobalRole, grResolver *auth.GlobalRoleResolver) ([]rbacv1.PolicyRule, error)) {
 	var grbs []*apisv3.GlobalRoleBinding
 	// gather all grbs that apply to this user through group or user assignment
 	for _, group := range user.GetGroups() {

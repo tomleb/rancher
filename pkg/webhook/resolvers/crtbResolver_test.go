@@ -3,10 +3,10 @@ package resolvers
 import (
 	"testing"
 
-	"github.com/golang/mock/gomock"
+	"go.uber.org/mock/gomock"
 	apisv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
-	"github.com/rancher/webhook/pkg/auth"
-	v3 "github.com/rancher/webhook/pkg/generated/controllers/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/webhook/auth"
+	v3 "github.com/rancher/rancher/pkg/generated/controllers/management.cattle.io/v3"
 	"github.com/rancher/wrangler/v3/pkg/generic/fake"
 	"github.com/stretchr/testify/suite"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -250,7 +250,7 @@ func (c *CRTBResolverSuite) TestCRTBRuleResolver() {
 	}
 	for _, tt := range tests {
 		c.Run(tt.name, func() {
-			gotRules, err := resolver.RulesFor(tt.user, tt.clusterName)
+			gotRules, err := resolver.RulesFor(context.Background(), tt.user, tt.clusterName)
 			if tt.wantErr {
 				c.Errorf(err, "CRTBRuleResolver.RulesFor() error = %v, wantErr %v", err, tt.wantErr)
 				// still check result because function is suppose to return partial results.

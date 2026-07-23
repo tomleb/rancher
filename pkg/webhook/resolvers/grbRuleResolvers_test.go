@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/golang/mock/gomock"
+	"go.uber.org/mock/gomock"
 	v3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
-	"github.com/rancher/webhook/pkg/auth"
+	"github.com/rancher/rancher/pkg/webhook/auth"
 	"github.com/rancher/wrangler/v3/pkg/generic/fake"
 	"github.com/stretchr/testify/suite"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -327,7 +327,7 @@ func (g *GRBClusterRuleResolverSuite) TestGRBClusterRuleResolver() {
 			grResolver := auth.NewGlobalRoleResolver(auth.NewRoleTemplateResolver(state.rtCache, nil), state.grCache)
 			grbResolvers := NewGRBRuleResolvers(state.grbCache, grResolver)
 
-			rules, err := grbResolvers.ICRResolver.RulesFor(g.userInfo, test.namespace)
+			rules, err := grbResolvers.ICRResolver.RulesFor(context.Background(), g.userInfo, test.namespace)
 			g.Require().Len(rules, len(test.wantRules))
 			for _, rule := range test.wantRules {
 				g.Require().Contains(rules, rule)

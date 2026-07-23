@@ -5,10 +5,11 @@
 package mocks
 
 import (
+	context "context"
 	fmt "fmt"
 	reflect "reflect"
 
-	gomock "github.com/golang/mock/gomock"
+	gomock "go.uber.org/mock/gomock"
 	v1 "k8s.io/api/rbac/v1"
 	user "k8s.io/apiserver/pkg/authentication/user"
 )
@@ -37,43 +38,43 @@ func (m *MockAuthorizationRuleResolver) EXPECT() *MockAuthorizationRuleResolverM
 }
 
 // GetRoleReferenceRules mocks base method.
-func (m *MockAuthorizationRuleResolver) GetRoleReferenceRules(arg0 v1.RoleRef, arg1 string) ([]v1.PolicyRule, error) {
+func (m *MockAuthorizationRuleResolver) GetRoleReferenceRules(ctx context.Context, arg0 v1.RoleRef, arg1 string) ([]v1.PolicyRule, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "GetRoleReferenceRules", arg0, arg1)
+	ret := m.ctrl.Call(m, "GetRoleReferenceRules", ctx, arg0, arg1)
 	ret0, _ := ret[0].([]v1.PolicyRule)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // GetRoleReferenceRules indicates an expected call of GetRoleReferenceRules.
-func (mr *MockAuthorizationRuleResolverMockRecorder) GetRoleReferenceRules(arg0, arg1 interface{}) *gomock.Call {
+func (mr *MockAuthorizationRuleResolverMockRecorder) GetRoleReferenceRules(arg0, arg1, arg2 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetRoleReferenceRules", reflect.TypeOf((*MockAuthorizationRuleResolver)(nil).GetRoleReferenceRules), arg0, arg1)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetRoleReferenceRules", reflect.TypeOf((*MockAuthorizationRuleResolver)(nil).GetRoleReferenceRules), arg0, arg1, arg2)
 }
 
 // RulesFor mocks base method.
-func (m *MockAuthorizationRuleResolver) RulesFor(arg0 user.Info, arg1 string) ([]v1.PolicyRule, error) {
+func (m *MockAuthorizationRuleResolver) RulesFor(ctx context.Context, arg0 user.Info, arg1 string) ([]v1.PolicyRule, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "RulesFor", arg0, arg1)
+	ret := m.ctrl.Call(m, "RulesFor", ctx, arg0, arg1)
 	ret0, _ := ret[0].([]v1.PolicyRule)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // RulesFor indicates an expected call of RulesFor.
-func (mr *MockAuthorizationRuleResolverMockRecorder) RulesFor(arg0, arg1 interface{}) *gomock.Call {
+func (mr *MockAuthorizationRuleResolverMockRecorder) RulesFor(arg0, arg1, arg2 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RulesFor", reflect.TypeOf((*MockAuthorizationRuleResolver)(nil).RulesFor), arg0, arg1)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RulesFor", reflect.TypeOf((*MockAuthorizationRuleResolver)(nil).RulesFor), arg0, arg1, arg2)
 }
 
 // VisitRulesFor mocks base method.
-func (m *MockAuthorizationRuleResolver) VisitRulesFor(arg0 user.Info, arg1 string, arg2 func(fmt.Stringer, *v1.PolicyRule, error) bool) {
+func (m *MockAuthorizationRuleResolver) VisitRulesFor(ctx context.Context, arg0 user.Info, arg1 string, arg2 func(fmt.Stringer, *v1.PolicyRule, error) bool) {
 	m.ctrl.T.Helper()
-	m.ctrl.Call(m, "VisitRulesFor", arg0, arg1, arg2)
+	m.ctrl.Call(m, "VisitRulesFor", ctx, arg0, arg1, arg2)
 }
 
 // VisitRulesFor indicates an expected call of VisitRulesFor.
-func (mr *MockAuthorizationRuleResolverMockRecorder) VisitRulesFor(arg0, arg1, arg2 interface{}) *gomock.Call {
+func (mr *MockAuthorizationRuleResolverMockRecorder) VisitRulesFor(arg0, arg1, arg2, arg3 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "VisitRulesFor", reflect.TypeOf((*MockAuthorizationRuleResolver)(nil).VisitRulesFor), arg0, arg1, arg2)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "VisitRulesFor", reflect.TypeOf((*MockAuthorizationRuleResolver)(nil).VisitRulesFor), arg0, arg1, arg2, arg3)
 }

@@ -7,7 +7,7 @@ import (
 
 	v1 "github.com/rancher/rancher/pkg/apis/provisioning.cattle.io/v1"
 	rkev1 "github.com/rancher/rancher/pkg/apis/rke.cattle.io/v1"
-	"github.com/rancher/webhook/pkg/admission"
+	"github.com/rancher/rancher/pkg/webhook/admission"
 	data2 "github.com/rancher/wrangler/v3/pkg/data"
 	"github.com/stretchr/testify/assert"
 	admissionv1 "k8s.io/api/admission/v1"
@@ -79,7 +79,7 @@ func Test_SetKubeAPIServerArg(t *testing.T) {
 			cluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							UpgradeStrategy: rkev1.ClusterUpgradeStrategy{},
 							ChartValues:     rkev1.GenericMap{},
 							MachineGlobalConfig: rkev1.GenericMap{
@@ -115,7 +115,7 @@ func Test_SetKubeAPIServerArg(t *testing.T) {
 			cluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							UpgradeStrategy: rkev1.ClusterUpgradeStrategy{},
 							ChartValues:     rkev1.GenericMap{},
 							MachineGlobalConfig: rkev1.GenericMap{
@@ -413,7 +413,7 @@ func clusterWithoutKubeAPIServerArg() *v1.Cluster {
 	return &v1.Cluster{
 		Spec: v1.ClusterSpec{
 			RKEConfig: &v1.RKEConfig{
-				RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+				ClusterConfiguration: rkev1.ClusterConfiguration{
 					UpgradeStrategy: rkev1.ClusterUpgradeStrategy{},
 					ChartValues:     rkev1.GenericMap{},
 					MachineGlobalConfig: rkev1.GenericMap{
@@ -508,7 +508,7 @@ func clusterWithMachineSelectorFile1() *v1.Cluster {
 	return &v1.Cluster{
 		Spec: v1.ClusterSpec{
 			RKEConfig: &v1.RKEConfig{
-				RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+				ClusterConfiguration: rkev1.ClusterConfiguration{
 					MachineSelectorFiles: []rkev1.RKEProvisioningFiles{
 						machineSelectorFile1(),
 					},
@@ -522,7 +522,7 @@ func clusterWithMachineSelectorFile1And2And3() *v1.Cluster {
 	return &v1.Cluster{
 		Spec: v1.ClusterSpec{
 			RKEConfig: &v1.RKEConfig{
-				RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+				ClusterConfiguration: rkev1.ClusterConfiguration{
 					MachineSelectorFiles: []rkev1.RKEProvisioningFiles{
 						machineSelectorFile1(),
 						machineSelectorFile2(),
@@ -538,7 +538,7 @@ func clusterWithMachineSelectorFile2And3() *v1.Cluster {
 	return &v1.Cluster{
 		Spec: v1.ClusterSpec{
 			RKEConfig: &v1.RKEConfig{
-				RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+				ClusterConfiguration: rkev1.ClusterConfiguration{
 					MachineSelectorFiles: []rkev1.RKEProvisioningFiles{
 						machineSelectorFile2(),
 						machineSelectorFile3(),
@@ -553,7 +553,7 @@ func clusterWithMachineSelectorFile1And2() *v1.Cluster {
 	return &v1.Cluster{
 		Spec: v1.ClusterSpec{
 			RKEConfig: &v1.RKEConfig{
-				RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+				ClusterConfiguration: rkev1.ClusterConfiguration{
 					MachineSelectorFiles: []rkev1.RKEProvisioningFiles{
 						machineSelectorFile1(),
 						machineSelectorFile2(),
@@ -568,7 +568,7 @@ func clusterWithMachineSelectorFile2() *v1.Cluster {
 	return &v1.Cluster{
 		Spec: v1.ClusterSpec{
 			RKEConfig: &v1.RKEConfig{
-				RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+				ClusterConfiguration: rkev1.ClusterConfiguration{
 					MachineSelectorFiles: []rkev1.RKEProvisioningFiles{
 						machineSelectorFile2(),
 					},
@@ -582,7 +582,7 @@ func clusterWithoutMachineSelectorFile() *v1.Cluster {
 	return &v1.Cluster{
 		Spec: v1.ClusterSpec{
 			RKEConfig: &v1.RKEConfig{
-				RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{},
+				ClusterConfiguration: rkev1.ClusterConfiguration{},
 			},
 		},
 	}

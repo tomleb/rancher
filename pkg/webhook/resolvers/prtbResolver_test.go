@@ -3,10 +3,10 @@ package resolvers
 import (
 	"testing"
 
-	"github.com/golang/mock/gomock"
+	"go.uber.org/mock/gomock"
 	apisv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
-	"github.com/rancher/webhook/pkg/auth"
-	v3 "github.com/rancher/webhook/pkg/generated/controllers/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/webhook/auth"
+	v3 "github.com/rancher/rancher/pkg/generated/controllers/management.cattle.io/v3"
 	"github.com/rancher/wrangler/v3/pkg/generic/fake"
 	"github.com/stretchr/testify/suite"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -252,7 +252,7 @@ func (p *PRTBResolverSuite) TestPRTBRuleResolver() {
 		p.Run(tt.name, func() {
 			namespace, ok := namespaceFromProject(tt.projectName)
 			p.Require().True(ok, "failed to split project namespace from project name")
-			gotRules, err := resolver.RulesFor(tt.user, namespace)
+			gotRules, err := resolver.RulesFor(context.Background(), tt.user, namespace)
 			if tt.wantErr {
 				p.Errorf(err, "PRTBRuleResolver.RulesFor() error = %v, wantErr %v", err, tt.wantErr)
 				// still check result because function is suppose to return partial results.

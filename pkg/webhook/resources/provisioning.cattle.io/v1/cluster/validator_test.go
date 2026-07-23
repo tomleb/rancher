@@ -6,7 +6,7 @@ import (
 
 	v1 "github.com/rancher/rancher/pkg/apis/provisioning.cattle.io/v1"
 	rkev1 "github.com/rancher/rancher/pkg/apis/rke.cattle.io/v1"
-	"github.com/rancher/webhook/pkg/admission"
+	"github.com/rancher/rancher/pkg/webhook/admission"
 	"github.com/stretchr/testify/assert"
 	admissionv1 "k8s.io/api/admission/v1"
 )
@@ -283,7 +283,7 @@ func TestValidateSystemAgentDataDirectory(t *testing.T) {
 			cluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								SystemAgent: "a",
 							},
@@ -294,7 +294,7 @@ func TestValidateSystemAgentDataDirectory(t *testing.T) {
 			oldCluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								SystemAgent: "a",
 							},
@@ -309,7 +309,7 @@ func TestValidateSystemAgentDataDirectory(t *testing.T) {
 			cluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								SystemAgent: "a",
 							},
@@ -320,7 +320,7 @@ func TestValidateSystemAgentDataDirectory(t *testing.T) {
 			oldCluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								SystemAgent: "b",
 							},
@@ -355,7 +355,7 @@ func TestValidateSystemAgentDataDirectory(t *testing.T) {
 			cluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								SystemAgent: "a",
 							},
@@ -381,7 +381,7 @@ func TestValidateSystemAgentDataDirectory(t *testing.T) {
 			cluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								SystemAgent: "b",
 							},
@@ -418,7 +418,7 @@ func TestValidateSystemAgentDataDirectory(t *testing.T) {
 			oldCluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								SystemAgent: "a",
 							},
@@ -460,7 +460,7 @@ func TestValidateSystemAgentDataDirectory(t *testing.T) {
 			oldCluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								SystemAgent: "a",
 							},
@@ -496,7 +496,7 @@ func TestValidateSystemAgentDataDirectory(t *testing.T) {
 			cluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								SystemAgent: "a",
 							},
@@ -517,7 +517,7 @@ func TestValidateSystemAgentDataDirectory(t *testing.T) {
 			cluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								SystemAgent: "a",
 							},
@@ -534,7 +534,7 @@ func TestValidateSystemAgentDataDirectory(t *testing.T) {
 			oldCluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								SystemAgent: "a",
 							},
@@ -549,7 +549,7 @@ func TestValidateSystemAgentDataDirectory(t *testing.T) {
 			cluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								SystemAgent: "a",
 							},
@@ -666,7 +666,7 @@ func TestValidateDataDirectories(t *testing.T) {
 			cluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								K8sDistro: "a",
 							},
@@ -682,7 +682,7 @@ func TestValidateDataDirectories(t *testing.T) {
 			cluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								Provisioning: "a",
 							},
@@ -698,7 +698,7 @@ func TestValidateDataDirectories(t *testing.T) {
 			cluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								SystemAgent: "a",
 							},
@@ -714,7 +714,7 @@ func TestValidateDataDirectories(t *testing.T) {
 			cluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								K8sDistro:    "/a",
 								Provisioning: "/a",
@@ -731,7 +731,7 @@ func TestValidateDataDirectories(t *testing.T) {
 			cluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								K8sDistro:   "/a",
 								SystemAgent: "/a",
@@ -748,7 +748,7 @@ func TestValidateDataDirectories(t *testing.T) {
 			cluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								Provisioning: "/a",
 								SystemAgent:  "/a",
@@ -765,7 +765,7 @@ func TestValidateDataDirectories(t *testing.T) {
 			cluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								K8sDistro:    "/a",
 								Provisioning: "/a/b",
@@ -782,7 +782,7 @@ func TestValidateDataDirectories(t *testing.T) {
 			cluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								K8sDistro:    "/a/b",
 								Provisioning: "/a",
@@ -894,7 +894,7 @@ func TestValidateDataDirectories(t *testing.T) {
 			cluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								SystemAgent: "/a",
 							},
@@ -921,7 +921,7 @@ func TestValidateDataDirectories(t *testing.T) {
 			cluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								SystemAgent: "/a",
 							},
@@ -932,7 +932,7 @@ func TestValidateDataDirectories(t *testing.T) {
 			oldCluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								SystemAgent: "/b",
 							},
@@ -948,7 +948,7 @@ func TestValidateDataDirectories(t *testing.T) {
 			cluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								Provisioning: "/a",
 							},
@@ -959,7 +959,7 @@ func TestValidateDataDirectories(t *testing.T) {
 			oldCluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								Provisioning: "/b",
 							},
@@ -975,7 +975,7 @@ func TestValidateDataDirectories(t *testing.T) {
 			cluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								K8sDistro: "/a",
 							},
@@ -986,7 +986,7 @@ func TestValidateDataDirectories(t *testing.T) {
 			oldCluster: &v1.Cluster{
 				Spec: v1.ClusterSpec{
 					RKEConfig: &v1.RKEConfig{
-						RKEClusterSpecCommon: rkev1.RKEClusterSpecCommon{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
 							DataDirectories: rkev1.DataDirectories{
 								K8sDistro: "/b",
 							},

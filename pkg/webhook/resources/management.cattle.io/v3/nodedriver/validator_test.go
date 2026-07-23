@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/golang/mock/gomock"
+	"go.uber.org/mock/gomock"
 	v3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
-	"github.com/rancher/webhook/pkg/admission"
+	"github.com/rancher/rancher/pkg/webhook/admission"
 	"github.com/rancher/wrangler/v3/pkg/generic/fake"
 	"github.com/stretchr/testify/suite"
 	admissionv1 "k8s.io/api/admission/v1"
@@ -54,32 +54,6 @@ func (suite *NodeDriverValidationSuite) TestHappyPath() {
 
 	suite.Nil(err)
 	suite.True(resp.Allowed, "admission request was denied")
-}
-
-func (suite *NodeDriverValidationSuite) TestRKE1NotDeleted() {
-	ctrl := gomock.NewController(suite.T())
-	mockCache := fake.NewMockCacheInterface[*v3.Node](ctrl)
-	mockCache.EXPECT().List("", labels.Everything()).Return([]*v3.Node{
-		{Status: v3.NodeStatus{NodeTemplateSpec: &v3.NodeTemplateSpec{
-			Driver: "testing",
-		}}},
-	}, nil)
-
-	a := admitter{
-		nodeCache: mockCache,
-		dynamic:   &mockLister{},
-	}
-
-	resp, err := a.Admit(&admission.Request{
-		Context: context.Background(),
-		AdmissionRequest: admissionv1.AdmissionRequest{
-			Operation: admissionv1.Update,
-			OldObject: runtime.RawExtension{Raw: newNodeDriver(true, nil)},
-			Object:    runtime.RawExtension{Raw: newNodeDriver(false, nil)},
-		}})
-
-	suite.Nil(err)
-	suite.False(resp.Allowed, "admission request was allowed through")
 }
 
 func (suite *NodeDriverValidationSuite) TestRKE2NotDeleted() {
@@ -137,31 +111,6 @@ func (suite *NodeDriverValidationSuite) TestDeleteGood() {
 
 	suite.Nil(err)
 	suite.True(resp.Allowed, "admission request was denied")
-}
-
-func (suite *NodeDriverValidationSuite) TestDeleteRKE1Bad() {
-	ctrl := gomock.NewController(suite.T())
-	mockCache := fake.NewMockCacheInterface[*v3.Node](ctrl)
-	mockCache.EXPECT().List("", labels.Everything()).Return([]*v3.Node{
-		{Status: v3.NodeStatus{NodeTemplateSpec: &v3.NodeTemplateSpec{
-			Driver: "testing",
-		}}},
-	}, nil)
-
-	a := admitter{
-		nodeCache: mockCache,
-		dynamic:   &mockLister{},
-	}
-
-	resp, err := a.Admit(&admission.Request{
-		Context: context.Background(),
-		AdmissionRequest: admissionv1.AdmissionRequest{
-			Operation: admissionv1.Delete,
-			OldObject: runtime.RawExtension{Raw: newNodeDriver(true, nil)},
-		}})
-
-	suite.Nil(err)
-	suite.False(resp.Allowed, "admission request was allowed")
 }
 
 func (suite *NodeDriverValidationSuite) TestDeleteRKE2Bad() {

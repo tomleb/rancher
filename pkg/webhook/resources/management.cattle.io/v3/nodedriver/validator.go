@@ -6,9 +6,9 @@ import (
 
 	"github.com/rancher/lasso/pkg/dynamic"
 	v3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
-	"github.com/rancher/webhook/pkg/admission"
-	controllersv3 "github.com/rancher/webhook/pkg/generated/controllers/management.cattle.io/v3"
-	objectsv3 "github.com/rancher/webhook/pkg/generated/objects/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/webhook/admission"
+	controllersv3 "github.com/rancher/rancher/pkg/generated/controllers/management.cattle.io/v3"
+	objectsv3 "github.com/rancher/rancher/pkg/webhook/generated/objects/management.cattle.io/v3"
 	admissionv1 "k8s.io/api/admission/v1"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -92,43 +92,18 @@ func (a *admitter) Admit(request *admission.Request) (*admissionv1.AdmissionResp
 		return admission.ResponseAllowed(), nil
 	}
 
-	// check if all node resources have been deleted for both cluster types
-	rke1Deleted, err := a.rke1ResourcesDeleted(oldObject)
-	if err != nil {
-		return nil, err
-	}
+	// check if all rke-machine (RKE2) node resources have been deleted.
+	// RKE1 support was removed from rancher/rancher, so only RKE2 resources are checked here.
 	rke2Deleted, err := a.rke2ResourcesDeleted(oldObject)
 	if err != nil {
 		return nil, err
 	}
 
-	if !(rke1Deleted && rke2Deleted) {
+	if !rke2Deleted {
 		return driverInUse, nil
 	}
 
 	return admission.ResponseAllowed(), nil
-}
-
-// // RKE1
-// this one is a bit more clean since we're just looking at nodes with
-// the <displayname> provider
-func (a *admitter) rke1ResourcesDeleted(driver *v3.NodeDriver) (bool, error) {
-	nodes, err := a.nodeCache.List("", labels.Everything())
-	if err != nil {
-		return false, fmt.Errorf("error listing nodes from cache: %w", err)
-	}
-
-	for _, node := range nodes {
-		if node.Status.NodeTemplateSpec == nil {
-			continue
-		}
-
-		if node.Status.NodeTemplateSpec.Driver == driver.Spec.DisplayName {
-			return false, nil
-		}
-	}
-
-	return true, nil
 }
 
 // // RKE2

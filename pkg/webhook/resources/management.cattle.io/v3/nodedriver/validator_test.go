@@ -5,10 +5,8 @@ import (
 	"encoding/json"
 	"testing"
 
-	"go.uber.org/mock/gomock"
 	v3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	"github.com/rancher/rancher/pkg/webhook/admission"
-	"github.com/rancher/wrangler/v3/pkg/generic/fake"
 	"github.com/stretchr/testify/suite"
 	admissionv1 "k8s.io/api/admission/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,13 +33,8 @@ func (m *mockLister) List(_ schema.GroupVersionKind, _ string, _ labels.Selector
 }
 
 func (suite *NodeDriverValidationSuite) TestHappyPath() {
-	ctrl := gomock.NewController(suite.T())
-	mockCache := fake.NewMockCacheInterface[*v3.Node](ctrl)
-	mockCache.EXPECT().List("", labels.Everything()).Return([]*v3.Node{}, nil)
-
 	a := admitter{
-		nodeCache: mockCache,
-		dynamic:   &mockLister{},
+		dynamic: &mockLister{},
 	}
 
 	resp, err := a.Admit(&admission.Request{
@@ -57,13 +50,8 @@ func (suite *NodeDriverValidationSuite) TestHappyPath() {
 }
 
 func (suite *NodeDriverValidationSuite) TestRKE2NotDeleted() {
-	ctrl := gomock.NewController(suite.T())
-	mockCache := fake.NewMockCacheInterface[*v3.Node](ctrl)
-	mockCache.EXPECT().List("", labels.Everything()).Return([]*v3.Node{}, nil)
-
 	a := admitter{
-		nodeCache: mockCache,
-		dynamic:   &mockLister{toReturn: []runtime.Object{&runtime.Unknown{}}},
+		dynamic: &mockLister{toReturn: []runtime.Object{&runtime.Unknown{}}},
 	}
 
 	resp, err := a.Admit(&admission.Request{
@@ -93,13 +81,8 @@ func (suite *NodeDriverValidationSuite) TestNotDisablingDriver() {
 }
 
 func (suite *NodeDriverValidationSuite) TestDeleteGood() {
-	ctrl := gomock.NewController(suite.T())
-	mockCache := fake.NewMockCacheInterface[*v3.Node](ctrl)
-	mockCache.EXPECT().List("", labels.Everything()).Return([]*v3.Node{}, nil)
-
 	a := admitter{
-		nodeCache: mockCache,
-		dynamic:   &mockLister{},
+		dynamic: &mockLister{},
 	}
 
 	resp, err := a.Admit(&admission.Request{
@@ -114,13 +97,8 @@ func (suite *NodeDriverValidationSuite) TestDeleteGood() {
 }
 
 func (suite *NodeDriverValidationSuite) TestDeleteRKE2Bad() {
-	ctrl := gomock.NewController(suite.T())
-	mockCache := fake.NewMockCacheInterface[*v3.Node](ctrl)
-	mockCache.EXPECT().List("", labels.Everything()).Return([]*v3.Node{}, nil)
-
 	a := admitter{
-		nodeCache: mockCache,
-		dynamic:   &mockLister{toReturn: []runtime.Object{&runtime.Unknown{}}},
+		dynamic: &mockLister{toReturn: []runtime.Object{&runtime.Unknown{}}},
 	}
 
 	resp, err := a.Admit(&admission.Request{

@@ -7,7 +7,6 @@ import (
 	"github.com/rancher/lasso/pkg/dynamic"
 	v3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	"github.com/rancher/rancher/pkg/webhook/admission"
-	controllersv3 "github.com/rancher/rancher/pkg/generated/controllers/management.cattle.io/v3"
 	objectsv3 "github.com/rancher/rancher/pkg/webhook/generated/objects/management.cattle.io/v3"
 	admissionv1 "k8s.io/api/admission/v1"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
@@ -39,8 +38,7 @@ type Validator struct {
 }
 
 type admitter struct {
-	nodeCache controllersv3.NodeCache
-	dynamic   dynamicLister
+	dynamic dynamicLister
 }
 
 // dynamicLister is an interface to abstract away how we list dynamic objects from k8s
@@ -49,10 +47,9 @@ type dynamicLister interface {
 }
 
 // NewValidator returns a new Validator for NodeDriver resources
-func NewValidator(nodeCache controllersv3.NodeCache, dynamic *dynamic.Controller) admission.ValidatingAdmissionHandler {
+func NewValidator(dynamic *dynamic.Controller) admission.ValidatingAdmissionHandler {
 	return &Validator{admitter: admitter{
-		nodeCache: nodeCache,
-		dynamic:   dynamic,
+		dynamic: dynamic,
 	}}
 }
 

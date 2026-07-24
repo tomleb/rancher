@@ -14,7 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	k8fake "k8s.io/client-go/kubernetes/typed/authorization/v1/fake"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
 	k8testing "k8s.io/client-go/testing"
 )
 
@@ -193,12 +193,12 @@ func TestValidateProjectNamespaceAnnotations(t *testing.T) {
 	for _, test := range tests {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
-			k8Fake := &k8testing.Fake{}
-			fakeSAR := &k8fake.FakeSubjectAccessReviews{Fake: &k8fake.FakeAuthorizationV1{Fake: k8Fake}}
+			clientset := k8sfake.NewSimpleClientset()
+			fakeSAR := clientset.AuthorizationV1().SubjectAccessReviews()
 			admitter := projectNamespaceAdmitter{
 				sar: fakeSAR,
 			}
-			k8Fake.AddReactor("create", "subjectaccessreviews", func(action k8testing.Action) (handled bool, ret runtime.Object, err error) {
+			clientset.PrependReactor("create", "subjectaccessreviews", func(action k8testing.Action) (handled bool, ret runtime.Object, err error) {
 				createAction := action.(k8testing.CreateActionImpl)
 				review := createAction.GetObject().(*authorizationv1.SubjectAccessReview)
 				spec := review.Spec

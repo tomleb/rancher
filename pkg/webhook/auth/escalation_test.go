@@ -16,7 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	k8fake "k8s.io/client-go/kubernetes/typed/authorization/v1/fake"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
 	k8testing "k8s.io/client-go/testing"
 	"k8s.io/kubernetes/pkg/registry/rbac/validation"
 )
@@ -177,9 +177,9 @@ func (e *EscalationSuite) TestRequestUserHasVerb() {
 	const unknownUser = "unknownUser"
 	const errorUser = "errorUser"
 	goodRequest := e.newDefaultRequest(testUser)
-	k8Fake := &k8testing.Fake{}
-	fakeSAR := &k8fake.FakeSubjectAccessReviews{Fake: &k8fake.FakeAuthorizationV1{Fake: k8Fake}}
-	k8Fake.AddReactor("create", "subjectaccessreviews", func(action k8testing.Action) (handled bool, ret runtime.Object, err error) {
+	clientset := k8sfake.NewSimpleClientset()
+	fakeSAR := clientset.AuthorizationV1().SubjectAccessReviews()
+	clientset.PrependReactor("create", "subjectaccessreviews", func(action k8testing.Action) (handled bool, ret runtime.Object, err error) {
 		createAction := action.(k8testing.CreateActionImpl)
 		review := createAction.GetObject().(*authorizationv1.SubjectAccessReview)
 		spec := review.Spec

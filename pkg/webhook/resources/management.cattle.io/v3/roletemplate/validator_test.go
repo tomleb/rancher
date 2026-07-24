@@ -16,7 +16,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	k8fake "k8s.io/client-go/kubernetes/typed/authorization/v1/fake"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
 	k8testing "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/kubernetes/pkg/registry/rbac/validation"
@@ -62,9 +62,9 @@ func (r *RoleTemplateSuite) Test_PrivilegeEscalation() {
 	grCache := fake.NewMockNonNamespacedCacheInterface[*v3.GlobalRole](ctrl)
 	grCache.EXPECT().AddIndexer(expectedGlobalRefIndex, gomock.Any()).AnyTimes()
 
-	k8Fake := &k8testing.Fake{}
-	fakeSAR := &k8fake.FakeSubjectAccessReviews{Fake: &k8fake.FakeAuthorizationV1{Fake: k8Fake}}
-	k8Fake.AddReactor("create", "subjectaccessreviews", func(action k8testing.Action) (handled bool, ret runtime.Object, err error) {
+	clientset := k8sfake.NewSimpleClientset()
+	fakeSAR := clientset.AuthorizationV1().SubjectAccessReviews()
+	clientset.PrependReactor("create", "subjectaccessreviews", func(action k8testing.Action) (handled bool, ret runtime.Object, err error) {
 		createAction := action.(k8testing.CreateActionImpl)
 		review := createAction.GetObject().(*authorizationv1.SubjectAccessReview)
 		spec := review.Spec
@@ -268,9 +268,9 @@ func (r *RoleTemplateSuite) Test_UpdateValidation() {
 	grCache := fake.NewMockNonNamespacedCacheInterface[*v3.GlobalRole](ctrl)
 	grCache.EXPECT().AddIndexer(expectedGlobalRefIndex, gomock.Any())
 
-	k8Fake := &k8testing.Fake{}
-	fakeSAR := &k8fake.FakeSubjectAccessReviews{Fake: &k8fake.FakeAuthorizationV1{Fake: k8Fake}}
-	k8Fake.AddReactor("create", "subjectaccessreviews", func(action k8testing.Action) (handled bool, ret runtime.Object, err error) {
+	clientset := k8sfake.NewSimpleClientset()
+	fakeSAR := clientset.AuthorizationV1().SubjectAccessReviews()
+	clientset.PrependReactor("create", "subjectaccessreviews", func(action k8testing.Action) (handled bool, ret runtime.Object, err error) {
 		createAction := action.(k8testing.CreateActionImpl)
 		review := createAction.GetObject().(*authorizationv1.SubjectAccessReview)
 		if review.Spec.User == noPrivUser {
@@ -571,8 +571,8 @@ func (r *RoleTemplateSuite) Test_Create() {
 	grCache := fake.NewMockNonNamespacedCacheInterface[*v3.GlobalRole](ctrl)
 	grCache.EXPECT().AddIndexer(expectedGlobalRefIndex, gomock.Any()).AnyTimes()
 
-	k8Fake := &k8testing.Fake{}
-	fakeSAR := &k8fake.FakeSubjectAccessReviews{Fake: &k8fake.FakeAuthorizationV1{Fake: k8Fake}}
+	clientset := k8sfake.NewSimpleClientset()
+	fakeSAR := clientset.AuthorizationV1().SubjectAccessReviews()
 
 	tests := []tableTest{
 		{
@@ -756,8 +756,8 @@ func (r *RoleTemplateSuite) Test_Create() {
 func (r *RoleTemplateSuite) Test_Delete() {
 	resolver, _ := validation.NewTestRuleResolver(nil, nil, nil, nil)
 
-	k8Fake := &k8testing.Fake{}
-	fakeSAR := &k8fake.FakeSubjectAccessReviews{Fake: &k8fake.FakeAuthorizationV1{Fake: k8Fake}}
+	clientset := k8sfake.NewSimpleClientset()
+	fakeSAR := clientset.AuthorizationV1().SubjectAccessReviews()
 	type testMocks struct {
 		rtResolver *auth.RoleTemplateResolver
 		grCache    controllerv3.GlobalRoleCache
@@ -928,8 +928,8 @@ func (r *RoleTemplateSuite) Test_ErrorHandling() {
 	grCache := fake.NewMockNonNamespacedCacheInterface[*v3.GlobalRole](ctrl)
 	grCache.EXPECT().AddIndexer(expectedGlobalRefIndex, gomock.Any())
 
-	k8Fake := &k8testing.Fake{}
-	fakeSAR := &k8fake.FakeSubjectAccessReviews{Fake: &k8fake.FakeAuthorizationV1{Fake: k8Fake}}
+	clientset := k8sfake.NewSimpleClientset()
+	fakeSAR := clientset.AuthorizationV1().SubjectAccessReviews()
 	validator := roletemplate.NewValidator(resolver, roleResolver, fakeSAR, grCache)
 	admitters := validator.Admitters()
 	r.Len(admitters, 1, "wanted only one admitter")
@@ -966,8 +966,8 @@ func (r *RoleTemplateSuite) Test_CheckCircularRef() {
 	}
 	resolver, _ := validation.NewTestRuleResolver(nil, nil, clusterRoles, clusterRoleBindings)
 
-	k8Fake := &k8testing.Fake{}
-	fakeSAR := &k8fake.FakeSubjectAccessReviews{Fake: &k8fake.FakeAuthorizationV1{Fake: k8Fake}}
+	clientset := k8sfake.NewSimpleClientset()
+	fakeSAR := clientset.AuthorizationV1().SubjectAccessReviews()
 
 	tests := []struct {
 		name           string

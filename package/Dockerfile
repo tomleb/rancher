@@ -468,6 +468,28 @@ COPY pkg/ pkg/
 RUN --mount=type=cache,target=/root/.cache,id=rancher GOOS=$TARGETOS GOARCH=$TARGETARCH go build -tags "${TAGS}" -ldflags "${LDFLAGS}" ${GCFLAGS:+-gcflags "$GCFLAGS"} -o /app/agent ./cmd/agent
 
 
+# webhook-build produces the rancher-webhook binary from the merged-in webhook source
+# (pkg/webhook/..., cmd/webhook/main.go). Mirrors server-build/agent-build's shape; the
+# webhook binary ships as its own minimal image (see webhook-binary/webhook stages below)
+# rather than bundled into the server or agent images, to avoid bloating images that
+# don't run it.
+FROM --platform=$BUILDPLATFORM rancher-go-builder AS webhook-build
+ARG VERSION
+ARG COMMIT
+ARG LINKFLAGS="-extldflags -static -s"
+ARG LDFLAGS="-X main.Version=${VERSION} -X main.GitCommit=${COMMIT} ${LINKFLAGS}"
+ARG TARGETOS
+ARG TARGETARCH
+COPY cmd/ cmd/
+COPY internal/ internal/
+COPY pkg/ pkg/
+RUN --mount=type=cache,target=/root/.cache,id=rancher GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags "${LDFLAGS}" -o /app/webhook ./cmd/webhook
+
+# Output just the webhook binary
+FROM scratch AS webhook-binary
+COPY --from=webhook-build /app/webhook /webhook
+
+
 FROM base AS server
 ARG VERSION
 ARG BASE_REGISTRY
@@ -568,3 +590,28 @@ LABEL "io.artifacthub.package.logo-url"="https://raw.githubusercontent.com/ranch
     "org.opensuse.reference"=rancher/rancher-agent:${VERSION}
 
 ENTRYPOINT ["run.sh"]
+
+
+# webhook is the final image for rancher-webhook, built directly from cmd/webhook now
+# that its source lives in this monorepo (see webhook-build/webhook-binary stages above).
+# Kept as its own minimal image (registry.suse.com/bci/bci-micro) rather than folded into
+# the server/agent images, matching webhook's original packaging shape and image size.
+FROM registry.suse.com/bci/bci-micro:15.7 AS webhook
+
+ARG user=webhook
+RUN echo "$user:x:1000:1000::/home/$user:/bin/bash" >> /etc/passwd && \
+    echo "$user:x:1000:" >> /etc/group && \
+    mkdir /home/$user && \
+    chown -R $user:$user /home/$user
+
+COPY --from=webhook-build /app/webhook /usr/bin/
+
+USER $user
+
+LABEL "org.opencontainers.image.description"="Rancher Webhook: admission webhook for Rancher Manager." \
+    "org.opencontainers.image.title"="Rancher Webhook: admission webhook for Rancher Manager." \
+    "org.opencontainers.image.source"="https://github.com/rancher/rancher" \
+    "org.opencontainers.image.version"=${VERSION} \
+    "org.opensuse.reference"=rancher/rancher-webhook:${VERSION}
+
+CMD ["webhook"]

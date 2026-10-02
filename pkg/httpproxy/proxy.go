@@ -20,7 +20,6 @@ import (
 	provcluster "github.com/rancher/rancher/pkg/controllers/provisioningv2/cluster"
 	mgmtv3 "github.com/rancher/rancher/pkg/generated/controllers/management.cattle.io/v3"
 	provv1 "github.com/rancher/rancher/pkg/generated/controllers/provisioning.cattle.io/v1"
-	v1 "github.com/rancher/rancher/pkg/generated/norman/core/v1"
 	v3 "github.com/rancher/rancher/pkg/generated/norman/management.cattle.io/v3"
 	"github.com/rancher/rancher/pkg/settings"
 	"github.com/rancher/rancher/pkg/types/config"
@@ -76,15 +75,34 @@ var (
 
 type Supplier func() []string
 
+// CredentialLister is the minimal interface needed to look up credential secrets by
+// namespace/name. It is deliberately narrower than the generated v1.SecretInterface so that
+// callers which don't have (or don't want to build) a full *config.ScaledContext — such as the
+// standalone cmd/httpproxy test harness — can supply a lightweight implementation instead.
+type CredentialLister interface {
+	Get(namespace, name string) (*corev1.Secret, error)
+}
+
 type proxy struct {
 	prefix             string
 	validHostsSupplier Supplier
-	credentials        v1.SecretInterface
+	credentials        CredentialLister
 	mgmtClustersCache  mgmtv3.ClusterCache
 	provClustersCache  provv1.ClusterCache
 	proxyEndpointCache mgmtv3.ProxyEndpointCache
 	authorizer         authorizer.Authorizer
 	insecureTransport  http.RoundTripper
+}
+
+// Dependencies holds the pieces NewProxyWithDeps needs in order to construct the proxy handler.
+// Unlike *config.ScaledContext, every field here is a small, self-contained interface that can be
+// satisfied without standing up the rest of Rancher.
+type Dependencies struct {
+	Credentials        CredentialLister
+	MgmtClustersCache  mgmtv3.ClusterCache
+	ProvClustersCache  provv1.ClusterCache
+	ProxyEndpointCache mgmtv3.ProxyEndpointCache
+	Authorizer         authorizer.Authorizer
 }
 
 func NewProxy(prefix string, validHosts Supplier, scaledContext *config.ScaledContext) (http.Handler, error) {
@@ -100,16 +118,28 @@ func NewProxy(prefix string, validHosts Supplier, scaledContext *config.ScaledCo
 		return nil, err
 	}
 
+	return NewProxyWithDeps(prefix, validHosts, Dependencies{
+		Credentials:        scaledContext.Core.Secrets("").Controller().Lister(),
+		MgmtClustersCache:  scaledContext.Wrangler.Mgmt.Cluster().Cache(),
+		ProvClustersCache:  scaledContext.Wrangler.Provisioning.Cluster().Cache(),
+		ProxyEndpointCache: scaledContext.Wrangler.Mgmt.ProxyEndpoint().Cache(),
+		Authorizer:         authorizerConfig,
+	})
+}
+
+// NewProxyWithDeps builds the proxy handler from already-constructed dependencies, without
+// requiring a *config.ScaledContext.
+func NewProxyWithDeps(prefix string, validHosts Supplier, deps Dependencies) (http.Handler, error) {
 	insecureTransport := http.DefaultTransport.(*http.Transport).Clone()
 	insecureTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
 	p := proxy{
-		authorizer:         authorizerConfig,
+		authorizer:         deps.Authorizer,
 		prefix:             prefix,
 		validHostsSupplier: validHosts,
-		credentials:        scaledContext.Core.Secrets(""),
-		mgmtClustersCache:  scaledContext.Wrangler.Mgmt.Cluster().Cache(),
-		provClustersCache:  scaledContext.Wrangler.Provisioning.Cluster().Cache(),
-		proxyEndpointCache: scaledContext.Wrangler.Mgmt.ProxyEndpoint().Cache(),
+		credentials:        deps.Credentials,
+		mgmtClustersCache:  deps.MgmtClustersCache,
+		provClustersCache:  deps.ProvClustersCache,
+		proxyEndpointCache: deps.ProxyEndpointCache,
 		insecureTransport:  insecureTransport,
 	}
 
@@ -394,7 +424,7 @@ func (p *proxy) secretGetter(req *http.Request, cAuth string) SecretGetter {
 				return nil, unauthorizedErr
 			}
 		}
-		return p.credentials.Controller().Lister().Get(namespace, name)
+		return p.credentials.Get(namespace, name)
 	}
 }
 

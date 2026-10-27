@@ -128,13 +128,13 @@ require (
 	github.com/rancher/fleet/pkg/apis v0.17.0-beta.2
 	github.com/rancher/fleet/pkg/helmvalues v0.17.0-beta.2
 	github.com/rancher/gke-operator v1.16.0-rc.4
-	github.com/rancher/jsonpath v0.0.0-20250620213443-ad24535cf0c1
+	github.com/rancher/jsonpath v0.0.0-20260423141252-c4e0c565a09f
 	github.com/rancher/kubernetes-provider-detector v0.1.6-0.20240606163014-fcae75779379
 	github.com/rancher/lasso v0.2.10
 	github.com/rancher/machine v0.15.0-rancher146-rc.7
 	github.com/rancher/muchang v0.1.1
 	github.com/rancher/norman v0.10.1
-	github.com/rancher/rancher/pkg/apis v0.0.0-20260520140148-1f22fcaec55b
+	github.com/rancher/rancher/pkg/apis v0.0.0-20261026221317-79f63a61d484
 	github.com/rancher/rancher/pkg/client v0.0.0
 	github.com/rancher/rancher/pkg/plan v0.0.0-20260828234415-cde38be6980a
 	github.com/rancher/remotedialer v0.6.2-rc.2
@@ -142,6 +142,7 @@ require (
 	github.com/rancher/shepherd v0.0.0-20261021194219-25800d4c8ac6
 	github.com/rancher/steve v0.10.9
 	github.com/rancher/system-upgrade-controller/pkg/apis v0.0.0-20260923180507-96eced818739
+	github.com/rancher/webhook v0.0.0-00010101000000-000000000000
 	github.com/rancher/wrangler/v3 v3.8.0-rc.3
 	github.com/robfig/cron v1.2.0
 	github.com/russellhaering/goxmldsig v1.6.1
@@ -164,6 +165,7 @@ require (
 	google.golang.org/grpc v1.84.0
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c
+	gopkg.in/evanphx/json-patch.v5 v5.9.11
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	helm.sh/helm/v4 v4.3.1
 	k8s.io/api v0.37.1
@@ -176,10 +178,12 @@ require (
 	k8s.io/kube-openapi v0.0.0-20260821135717-be32def86098
 	k8s.io/kubectl v0.37.1
 	k8s.io/kubernetes v1.37.1
+	k8s.io/pod-security-admission v0.37.1
 	k8s.io/utils v0.0.0-20260707023825-cf1189d6abe3
 	oras.land/oras-go/v2 v2.6.4
 	sigs.k8s.io/aws-iam-authenticator v0.7.21
 	sigs.k8s.io/cluster-api v1.14.3
+	sigs.k8s.io/cluster-api-provider-aws/v2 v2.13.1
 	sigs.k8s.io/cluster-api/api v1.14.3
 	sigs.k8s.io/controller-runtime v0.25.2
 	sigs.k8s.io/structured-merge-diff/v6 v6.4.2
@@ -398,10 +402,10 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.28.0 // indirect
 	go.yaml.in/yaml/v4 v4.0.0-rc.2 // indirect
-	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
+	golang.org/x/exp v0.0.0-20260727155853-b88d891fe743 // indirect
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/term v0.47.0 // indirect
-	golang.org/x/tools v0.51.0 // indirect
+	golang.org/x/tools v0.52.0 // indirect
 	gomodules.xyz/jsonpatch/v2 v2.5.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260921155816-b14227669459 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20261005182115-fad411399dd8 // indirect
@@ -414,11 +418,12 @@ require (
 	k8s.io/code-generator v0.37.1 // indirect
 	k8s.io/component-base v0.37.1 // indirect
 	k8s.io/component-helpers v0.37.1 // indirect
-	k8s.io/controller-manager v0.0.0 // indirect
+	k8s.io/controller-manager v0.37.0 // indirect
 	k8s.io/gengo v0.0.0-20250130153323-76c5745d3511 // indirect
 	k8s.io/gengo/v2 v2.0.0-20260408192533-25e2208e0dc3 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
 	k8s.io/kms v0.37.1 // indirect
+	k8s.io/kubelet v0.37.0 // indirect
 	k8s.io/streaming v0.37.1 // indirect
 	modernc.org/libc v1.77.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
@@ -431,3 +436,5 @@ require (
 	sigs.k8s.io/kustomize/kyaml v0.21.2 // indirect
 	sigs.k8s.io/randfill v1.0.0 // indirect
 )
+
+replace github.com/rancher/webhook => ../webhook

@@ -1,0 +1,1833 @@
+package projectroletemplatebinding_test
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"testing"
+	"time"
+
+	apisv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/webhook/auth"
+	"github.com/rancher/rancher/pkg/webhook/resolvers"
+	"github.com/rancher/rancher/pkg/webhook/resources/management.cattle.io/v3/projectroletemplatebinding"
+	"github.com/rancher/webhook/pkg/admission"
+	"github.com/rancher/wrangler/v3/pkg/generic/fake"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/suite"
+	"go.uber.org/mock/gomock"
+	v1 "k8s.io/api/admission/v1"
+	v1authentication "k8s.io/api/authentication/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/kubernetes/pkg/registry/rbac/validation"
+)
+
+var errExpected = errors.New("expected test error")
+
+const (
+	clusterID = "cluster-id"
+	projectID = "project-id"
+)
+
+type ProjectRoleTemplateBindingSuite struct {
+	suite.Suite
+	adminRT                   *apisv3.RoleTemplate
+	readNodesRT               *apisv3.RoleTemplate
+	lockedRT                  *apisv3.RoleTemplate
+	clusterContextRT          *apisv3.RoleTemplate
+	externalRulesWriteNodesRT *apisv3.RoleTemplate
+	externalClusterRoleRT     *apisv3.RoleTemplate
+	adminCR                   *rbacv1.ClusterRole
+	writeNodeCR               *rbacv1.ClusterRole
+	readPodsCR                *rbacv1.ClusterRole
+	readServiceRole           *rbacv1.Role
+}
+
+func TestProjectRoleTemplateBindings(t *testing.T) {
+	t.Parallel()
+	suite.Run(t, new(ProjectRoleTemplateBindingSuite))
+}
+
+func (p *ProjectRoleTemplateBindingSuite) SetupSuite() {
+	ruleReadPods := rbacv1.PolicyRule{
+		Verbs:     []string{"GET", "WATCH"},
+		APIGroups: []string{"v1"},
+		Resources: []string{"pods"},
+	}
+	ruleReadServices := rbacv1.PolicyRule{
+		Verbs:     []string{"GET", "WATCH"},
+		APIGroups: []string{"v1"},
+		Resources: []string{"services"},
+	}
+	ruleWriteNodes := rbacv1.PolicyRule{
+		Verbs:     []string{"PUT", "CREATE", "UPDATE"},
+		APIGroups: []string{"v1"},
+		Resources: []string{"nodes"},
+	}
+	ruleAdmin := rbacv1.PolicyRule{
+		Verbs:     []string{"*"},
+		APIGroups: []string{"*"},
+		Resources: []string{"*"},
+	}
+	p.readNodesRT = &apisv3.RoleTemplate{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "read-role",
+		},
+		DisplayName: "Read Role",
+		Rules:       []rbacv1.PolicyRule{ruleReadPods, ruleWriteNodes},
+		Context:     "project",
+	}
+	p.adminRT = &apisv3.RoleTemplate{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "admin-role",
+		},
+		DisplayName:    "Admin Role",
+		Rules:          []rbacv1.PolicyRule{ruleAdmin},
+		Builtin:        true,
+		Administrative: true,
+		Context:        "project",
+	}
+	p.externalRulesWriteNodesRT = &apisv3.RoleTemplate{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "external-rule-write-nodes",
+		},
+		DisplayName:    "External Role",
+		ExternalRules:  []rbacv1.PolicyRule{ruleWriteNodes},
+		External:       true,
+		Builtin:        true,
+		Administrative: true,
+		Context:        "project",
+	}
+	p.externalClusterRoleRT = &apisv3.RoleTemplate{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "read-pods-role",
+		},
+		DisplayName:    "External Role",
+		External:       true,
+		Builtin:        true,
+		Administrative: true,
+		Context:        "project",
+	}
+	p.lockedRT = &apisv3.RoleTemplate{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "locked-role",
+		},
+		DisplayName: "Locked Role",
+		Rules:       []rbacv1.PolicyRule{ruleReadServices},
+		Locked:      true,
+		Context:     "project",
+	}
+	p.clusterContextRT = &apisv3.RoleTemplate{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cluster-member",
+		},
+		DisplayName: "Cluster Member",
+		Rules:       []rbacv1.PolicyRule{ruleReadServices},
+		Context:     "cluster",
+	}
+	p.adminCR = &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "admin-role",
+		},
+		Rules: []rbacv1.PolicyRule{ruleAdmin},
+	}
+	p.writeNodeCR = &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{Name: "write-role"},
+		Rules:      []rbacv1.PolicyRule{ruleWriteNodes, ruleWriteNodes},
+	}
+	p.readServiceRole = &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "namespace1", Name: "read-service"},
+		Rules:      []rbacv1.PolicyRule{ruleReadServices},
+	}
+	p.readPodsCR = &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{Name: "read-pods-role"},
+		Rules:      []rbacv1.PolicyRule{ruleReadPods},
+	}
+}
+
+func (p *ProjectRoleTemplateBindingSuite) TestPrivilegeEscalation() {
+	const adminUser = "admin-userid"
+	const testUser = "test-userid"
+	const errorUser = "error-userid"
+	const prtbUser = "prtb-userid"
+	const crtbUser = "crtb-userid"
+	roles := []*rbacv1.Role{p.readServiceRole}
+	clusterRoles := []*rbacv1.ClusterRole{p.adminCR, p.writeNodeCR}
+	roleBindings := []*rbacv1.RoleBinding{
+		{
+			ObjectMeta: metav1.ObjectMeta{Namespace: p.readServiceRole.Namespace},
+			Subjects: []rbacv1.Subject{
+				{Kind: rbacv1.UserKind, Name: testUser},
+			},
+			RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: p.readServiceRole.Name},
+		},
+	}
+	clusterRoleBindings := []*rbacv1.ClusterRoleBinding{
+		{
+			Subjects: []rbacv1.Subject{
+				{Kind: rbacv1.UserKind, Name: adminUser},
+				{Kind: rbacv1.UserKind, Name: errorUser},
+			},
+			RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: p.adminCR.Name},
+		},
+	}
+	resolver, _ := validation.NewTestRuleResolver(roles, roleBindings, clusterRoles, clusterRoleBindings)
+
+	ctrl := gomock.NewController(p.T())
+	roleTemplateCache := fake.NewMockNonNamespacedCacheInterface[*apisv3.RoleTemplate](ctrl)
+	roleTemplateCache.EXPECT().Get(p.adminRT.Name).Return(p.adminRT, nil).AnyTimes()
+	clusterRoleCache := fake.NewMockNonNamespacedCacheInterface[*rbacv1.ClusterRole](ctrl)
+	roleResolver := auth.NewRoleTemplateResolver(roleTemplateCache, clusterRoleCache)
+	prtbCache := fake.NewMockCacheInterface[*apisv3.ProjectRoleTemplateBinding](ctrl)
+	prtbCache.EXPECT().AddIndexer(gomock.Any(), gomock.Any()).Times(2)
+	prtbCache.EXPECT().GetByIndex(gomock.Any(), resolvers.GetUserKey(prtbUser, projectID)).Return([]*apisv3.ProjectRoleTemplateBinding{{
+		UserName:         prtbUser,
+		RoleTemplateName: p.adminRT.Name,
+	},
+	}, nil).AnyTimes()
+	prtbCache.EXPECT().GetByIndex(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+	prtbCache.EXPECT().List(gomock.Any(), gomock.Any()).Return([]*apisv3.ProjectRoleTemplateBinding{}, nil).AnyTimes()
+	crtbCache := fake.NewMockCacheInterface[*apisv3.ClusterRoleTemplateBinding](ctrl)
+	crtbCache.EXPECT().AddIndexer(gomock.Any(), gomock.Any())
+	crtbCache.EXPECT().GetByIndex(gomock.Any(), resolvers.GetUserKey(crtbUser, clusterID)).Return([]*apisv3.ClusterRoleTemplateBinding{
+		{
+			UserName:         crtbUser,
+			RoleTemplateName: p.adminRT.Name,
+		},
+	}, nil).AnyTimes()
+	crtbCache.EXPECT().GetByIndex(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+
+	crtbResolver := resolvers.NewCRTBRuleResolver(crtbCache, roleResolver)
+	prtbResolver := resolvers.NewPRTBRuleResolver(prtbCache, roleResolver)
+
+	clusterCache := fake.NewMockNonNamespacedCacheInterface[*apisv3.Cluster](ctrl)
+	clusterCache.EXPECT().Get(clusterID).Return(&apisv3.Cluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: clusterID,
+		},
+	}, nil).AnyTimes()
+
+	projectCache := fake.NewMockCacheInterface[*apisv3.Project](ctrl)
+	projectCache.EXPECT().Get(clusterID, projectID).Return(&apisv3.Project{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: clusterID,
+			Name:      projectID,
+		},
+		Spec: apisv3.ProjectSpec{
+			ClusterName: clusterID,
+		},
+	}, nil).AnyTimes()
+	validator := projectroletemplatebinding.NewValidator(prtbResolver, crtbResolver, resolvers.NewPRTBClusterScopedRuleResolver(prtbCache, roleResolver), resolver, roleResolver, clusterCache, projectCache, prtbCache)
+	type args struct {
+		oldPRTB  func() *apisv3.ProjectRoleTemplateBinding
+		newPRTB  func() *apisv3.ProjectRoleTemplateBinding
+		username string
+	}
+	tests := []struct {
+		name    string
+		args    args
+		wantErr bool
+		allowed bool
+	}{
+		// base test admin correctly binding a different user to a roleTemplate {PASS}.
+		{
+			name: "base test valid privileges",
+			args: args{
+				username: adminUser,
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = testUser
+					basePRTB.RoleTemplateName = p.adminRT.Name
+					return basePRTB
+				},
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding { return nil },
+			},
+			allowed: true,
+		},
+
+		// Users privileges are stored in a crtb {PASS}.
+		{
+			name: "CRTB resolver test",
+			args: args{
+				username: crtbUser,
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = testUser
+					basePRTB.RoleTemplateName = p.adminRT.Name
+					return basePRTB
+				},
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding { return nil },
+			},
+			allowed: true,
+		},
+
+		// Users privileges are stored in a crtb {PASS}.
+		{
+			name: "PRTB resolver test",
+			args: args{
+				username: prtbUser,
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = testUser
+					basePRTB.RoleTemplateName = p.adminRT.Name
+					return basePRTB
+				},
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding { return nil },
+			},
+			allowed: true,
+		},
+
+		// Users attempting to privilege escalate another user get denied {FAIL}.
+		{
+			name: "privilege escalation other user",
+			args: args{
+				username: testUser,
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = errorUser
+					basePRTB.RoleTemplateName = p.adminRT.Name
+					return basePRTB
+				},
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding { return nil },
+			},
+			allowed: false,
+		},
+
+		// Users attempting to privilege escalate themselves  {FAIL}.
+		{
+			name: "privilege escalation self",
+			args: args{
+				username: testUser,
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = testUser
+					basePRTB.RoleTemplateName = p.adminRT.Name
+					return basePRTB
+				},
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding { return nil },
+			},
+			allowed: false,
+		},
+
+		// Test that user can still be admitted with failed auth check {PASS}.
+		{
+			name: "failed escalate verb check",
+			args: args{
+				username: errorUser,
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = testUser
+					basePRTB.RoleTemplateName = p.adminRT.Name
+					return basePRTB
+				},
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding { return nil },
+			},
+			allowed: true,
+		},
+	}
+
+	for i := range tests {
+		test := tests[i]
+		p.Run(test.name, func() {
+			p.T().Parallel()
+			req := createPRTBRequest(p.T(), test.args.oldPRTB(), test.args.newPRTB(), test.args.username)
+			admitters := validator.Admitters()
+			p.Len(admitters, 1)
+			resp, err := admitters[0].Admit(req)
+			p.NoError(err, "Admit failed")
+			if resp.Allowed != test.allowed {
+				p.Failf("Response was incorrectly validated", "Wanted response.Allowed = '%v' got %v: result=%+v", test.allowed, resp.Allowed, resp.Result)
+			}
+		})
+	}
+}
+
+func (p *ProjectRoleTemplateBindingSuite) TestClusterScopedRuleEscalation() {
+	const adminUser = "admin-userid"
+	const clusterWriteUser = "cluster-write-userid"
+	const projectWriteUser = "project-write-userid"
+	const clusterNSWriteUser = "cluster-ns-write-userid"
+	const crtbWriteUser = "crtb-write-userid"
+	const prtbClusterScopedUser = "prtb-cluster-scoped-userid"
+	const prtbProjectRulesUser = "prtb-project-rules-userid"
+	const prtbOtherClusterUser = "prtb-other-cluster-userid"
+	const noPermsUser = "no-perms-userid"
+	const otherProject = clusterID + ":other-project-id"
+
+	ruleWriteNodes := p.writeNodeCR.Rules[0]
+
+	// RoleTemplate whose permissions are only granted cluster-wide.
+	clusterScopedRT := &apisv3.RoleTemplate{
+		ObjectMeta:         metav1.ObjectMeta{Name: "cluster-scoped-role"},
+		DisplayName:        "Cluster Scoped Role",
+		Context:            "project",
+		ClusterScopedRules: []rbacv1.PolicyRule{ruleWriteNodes},
+	}
+	// RoleTemplate whose permissions are only granted within the project.
+	projectScopedRT := &apisv3.RoleTemplate{
+		ObjectMeta:  metav1.ObjectMeta{Name: "project-scoped-role"},
+		DisplayName: "Project Scoped Role",
+		Context:     "project",
+		Rules:       []rbacv1.PolicyRule{ruleWriteNodes},
+	}
+	// Cluster RoleTemplate granted to crtbWriteUser through a CRTB.
+	clusterWriteRT := &apisv3.RoleTemplate{
+		ObjectMeta:  metav1.ObjectMeta{Name: "cluster-write-role"},
+		DisplayName: "Cluster Write Role",
+		Context:     "cluster",
+		Rules:       []rbacv1.PolicyRule{ruleWriteNodes},
+	}
+	// project -> cluster -> project chain. Cluster templates have no cluster-scoped role, so a PRTB to chainRT does not
+	// grant clusterScopedRT's cluster-scoped rules.
+	clusterInheritsScopedRT := &apisv3.RoleTemplate{
+		ObjectMeta:        metav1.ObjectMeta{Name: "cluster-inherits-cluster-scoped-role"},
+		DisplayName:       "Cluster Inherits Cluster Scoped Role",
+		Context:           "cluster",
+		RoleTemplateNames: []string{clusterScopedRT.Name},
+	}
+	chainRT := &apisv3.RoleTemplate{
+		ObjectMeta:        metav1.ObjectMeta{Name: "project-inherits-cluster-role"},
+		DisplayName:       "Project Inherits Cluster Role",
+		Context:           "project",
+		RoleTemplateNames: []string{clusterInheritsScopedRT.Name},
+	}
+	crtbWrite := &apisv3.ClusterRoleTemplateBinding{
+		ObjectMeta:       metav1.ObjectMeta{Namespace: clusterID, Name: "crtb-write"},
+		ClusterName:      clusterID,
+		UserName:         crtbWriteUser,
+		RoleTemplateName: clusterWriteRT.Name,
+	}
+
+	// Role granting write nodes only within the project namespace.
+	projectWriteRole := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{Namespace: projectID, Name: "project-write-nodes"},
+		Rules:      []rbacv1.PolicyRule{ruleWriteNodes},
+	}
+	roles := []*rbacv1.Role{projectWriteRole}
+	roleBindings := []*rbacv1.RoleBinding{
+		{
+			ObjectMeta: metav1.ObjectMeta{Namespace: projectID},
+			Subjects:   []rbacv1.Subject{{Kind: rbacv1.UserKind, Name: projectWriteUser}},
+			RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: projectWriteRole.Name},
+		},
+		// Namespaced binding in the cluster namespace, which does not grant cluster-wide permissions.
+		{
+			ObjectMeta: metav1.ObjectMeta{Namespace: clusterID},
+			Subjects:   []rbacv1.Subject{{Kind: rbacv1.UserKind, Name: clusterNSWriteUser}},
+			RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: p.writeNodeCR.Name},
+		},
+	}
+	clusterRoles := []*rbacv1.ClusterRole{p.adminCR, p.writeNodeCR}
+	clusterRoleBindings := []*rbacv1.ClusterRoleBinding{
+		{
+			Subjects: []rbacv1.Subject{{Kind: rbacv1.UserKind, Name: adminUser}},
+			RoleRef:  rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: p.adminCR.Name},
+		},
+		{
+			Subjects: []rbacv1.Subject{{Kind: rbacv1.UserKind, Name: clusterWriteUser}},
+			RoleRef:  rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: p.writeNodeCR.Name},
+		},
+	}
+	resolver, _ := validation.NewTestRuleResolver(roles, roleBindings, clusterRoles, clusterRoleBindings)
+
+	ctrl := gomock.NewController(p.T())
+	roleTemplateCache := fake.NewMockNonNamespacedCacheInterface[*apisv3.RoleTemplate](ctrl)
+	roleTemplateCache.EXPECT().Get(clusterScopedRT.Name).Return(clusterScopedRT, nil).AnyTimes()
+	roleTemplateCache.EXPECT().Get(projectScopedRT.Name).Return(projectScopedRT, nil).AnyTimes()
+	roleTemplateCache.EXPECT().Get(clusterWriteRT.Name).Return(clusterWriteRT, nil).AnyTimes()
+	roleTemplateCache.EXPECT().Get(clusterInheritsScopedRT.Name).Return(clusterInheritsScopedRT, nil).AnyTimes()
+	roleTemplateCache.EXPECT().Get(chainRT.Name).Return(chainRT, nil).AnyTimes()
+	clusterRoleCache := fake.NewMockNonNamespacedCacheInterface[*rbacv1.ClusterRole](ctrl)
+	roleResolver := auth.NewRoleTemplateResolver(roleTemplateCache, clusterRoleCache)
+
+	prtbCache := fake.NewMockCacheInterface[*apisv3.ProjectRoleTemplateBinding](ctrl)
+	prtbCache.EXPECT().AddIndexer(gomock.Any(), gomock.Any()).Times(2)
+	// existing PRTB in another project of this cluster whose RoleTemplate grants ruleWriteNodes cluster-wide.
+	prtbCache.EXPECT().GetByIndex(gomock.Any(), resolvers.GetUserKey(prtbClusterScopedUser, clusterID)).Return([]*apisv3.ProjectRoleTemplateBinding{
+		{UserName: prtbClusterScopedUser, ProjectName: otherProject, RoleTemplateName: clusterScopedRT.Name},
+	}, nil).AnyTimes()
+	// existing PRTB in another project of this cluster whose RoleTemplate grants ruleWriteNodes only in that project.
+	prtbCache.EXPECT().GetByIndex(gomock.Any(), resolvers.GetUserKey(prtbProjectRulesUser, clusterID)).Return([]*apisv3.ProjectRoleTemplateBinding{
+		{UserName: prtbProjectRulesUser, ProjectName: otherProject, RoleTemplateName: projectScopedRT.Name},
+	}, nil).AnyTimes()
+	// existing PRTB granting ruleWriteNodes cluster-wide in a different cluster.
+	prtbCache.EXPECT().GetByIndex(gomock.Any(), resolvers.GetUserKey(prtbOtherClusterUser, "other-cluster-id")).Return([]*apisv3.ProjectRoleTemplateBinding{
+		{UserName: prtbOtherClusterUser, ProjectName: "other-cluster-id:p-other", RoleTemplateName: clusterScopedRT.Name},
+	}, nil).AnyTimes()
+	prtbCache.EXPECT().GetByIndex(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+	prtbCache.EXPECT().List(gomock.Any(), gomock.Any()).Return([]*apisv3.ProjectRoleTemplateBinding{}, nil).AnyTimes()
+
+	crtbCache := fake.NewMockCacheInterface[*apisv3.ClusterRoleTemplateBinding](ctrl)
+	crtbCache.EXPECT().AddIndexer(gomock.Any(), gomock.Any())
+	crtbCache.EXPECT().GetByIndex(gomock.Any(), resolvers.GetUserKey(crtbWriteUser, clusterID)).Return([]*apisv3.ClusterRoleTemplateBinding{crtbWrite}, nil).AnyTimes()
+	crtbCache.EXPECT().GetByIndex(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+
+	crtbResolver := resolvers.NewCRTBRuleResolver(crtbCache, roleResolver)
+	prtbResolver := resolvers.NewPRTBRuleResolver(prtbCache, roleResolver)
+
+	clusterCache := fake.NewMockNonNamespacedCacheInterface[*apisv3.Cluster](ctrl)
+	clusterCache.EXPECT().Get(clusterID).Return(&apisv3.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: clusterID},
+	}, nil).AnyTimes()
+
+	projectCache := fake.NewMockCacheInterface[*apisv3.Project](ctrl)
+	projectCache.EXPECT().Get(clusterID, projectID).Return(&apisv3.Project{
+		ObjectMeta: metav1.ObjectMeta{Namespace: clusterID, Name: projectID},
+		Spec:       apisv3.ProjectSpec{ClusterName: clusterID},
+	}, nil).AnyTimes()
+
+	validator := projectroletemplatebinding.NewValidator(prtbResolver, crtbResolver, resolvers.NewPRTBClusterScopedRuleResolver(prtbCache, roleResolver), resolver, roleResolver, clusterCache, projectCache, prtbCache)
+
+	tests := []struct {
+		name             string
+		username         string
+		roleTemplateName string
+		allowed          bool
+	}{
+		// cluster admin holds the permission cluster-wide {PASS}.
+		{
+			name:             "cluster admin can grant cluster-scoped rules",
+			username:         adminUser,
+			roleTemplateName: clusterScopedRT.Name,
+			allowed:          true,
+		},
+		// user holds the exact permission at the cluster level {PASS}.
+		{
+			name:             "user with cluster-level permissions can grant cluster-scoped rules",
+			username:         clusterWriteUser,
+			roleTemplateName: clusterScopedRT.Name,
+			allowed:          true,
+		},
+		// user only holds the permission within the project, cluster-scoped rules do not fall back to project {FAIL}.
+		{
+			name:             "user with only project-level permissions cannot grant cluster-scoped rules",
+			username:         projectWriteUser,
+			roleTemplateName: clusterScopedRT.Name,
+			allowed:          false,
+		},
+		// project-scoped rules still fall back to project-level permissions {PASS}.
+		{
+			name:             "user with project-level permissions can grant project-scoped rules",
+			username:         projectWriteUser,
+			roleTemplateName: projectScopedRT.Name,
+			allowed:          true,
+		},
+		// user only holds the permission through a RoleBinding in the cluster namespace, which is not cluster-wide {FAIL}.
+		{
+			name:             "user with only cluster namespace permissions cannot grant cluster-scoped rules",
+			username:         clusterNSWriteUser,
+			roleTemplateName: clusterScopedRT.Name,
+			allowed:          false,
+		},
+		// project-scoped rules can still be authorized by a RoleBinding in the cluster namespace {PASS}.
+		{
+			name:             "user with cluster namespace permissions can grant project-scoped rules",
+			username:         clusterNSWriteUser,
+			roleTemplateName: projectScopedRT.Name,
+			allowed:          true,
+		},
+		// user holds the permission through a CRTB for the cluster {PASS}.
+		{
+			name:             "user with CRTB permissions can grant cluster-scoped rules",
+			username:         crtbWriteUser,
+			roleTemplateName: clusterScopedRT.Name,
+			allowed:          true,
+		},
+		// user holds the permission cluster-wide through the cluster-scoped rules of a PRTB in another project of this cluster {PASS}.
+		{
+			name:             "user with cluster-scoped rules from an existing PRTB in the cluster can grant them",
+			username:         prtbClusterScopedUser,
+			roleTemplateName: clusterScopedRT.Name,
+			allowed:          true,
+		},
+		// user only holds the permission as project rules of a PRTB in another project, which are not cluster-wide {FAIL}.
+		{
+			name:             "project rules from an existing PRTB are not treated as cluster-wide",
+			username:         prtbProjectRulesUser,
+			roleTemplateName: clusterScopedRT.Name,
+			allowed:          false,
+		},
+		// user only holds the permission cluster-wide in a different cluster {FAIL}.
+		{
+			name:             "cluster-scoped rules from a PRTB in another cluster are not counted",
+			username:         prtbOtherClusterUser,
+			roleTemplateName: clusterScopedRT.Name,
+			allowed:          false,
+		},
+		// the binding grants nothing: cluster-scoped rules inherited through a cluster RoleTemplate are not granted {PASS}.
+		{
+			name:             "cluster-scoped rules inherited through a cluster RoleTemplate are not required",
+			username:         noPermsUser,
+			roleTemplateName: chainRT.Name,
+			allowed:          true,
+		},
+		// control: without the cluster template in between, the cluster-scoped rules are required {FAIL}.
+		{
+			name:             "user without permissions cannot grant cluster-scoped rules",
+			username:         noPermsUser,
+			roleTemplateName: clusterScopedRT.Name,
+			allowed:          false,
+		},
+	}
+
+	for i := range tests {
+		test := tests[i]
+		p.Run(test.name, func() {
+			p.T().Parallel()
+			newPRTB := newBasePRTB()
+			newPRTB.RoleTemplateName = test.roleTemplateName
+			req := createPRTBRequest(p.T(), nil, newPRTB, test.username)
+			admitters := validator.Admitters()
+			p.Len(admitters, 1)
+			resp, err := admitters[0].Admit(req)
+			p.NoError(err, "Admit failed")
+			if resp.Allowed != test.allowed {
+				p.Failf("Response was incorrectly validated", "Wanted response.Allowed = '%v' got %v: result=%+v", test.allowed, resp.Allowed, resp.Result)
+			}
+		})
+	}
+}
+
+func (p *ProjectRoleTemplateBindingSuite) TestValidationOnUpdate() {
+	const (
+		adminUser    = "admin-userid"
+		newUser      = "newUser-userid"
+		newUserPrinc = "local://newUser"
+		testGroup    = "testGroup"
+		missingRT    = "missing-roletemplate"
+		noRulesUser  = "no-rules-userid"
+
+		inheritsMissingRT = "inherits-missing-roletemplate"
+		errorRT           = "error-roletemplate"
+
+		externalMissingCRRT = "external-missing-clusterrole"
+	)
+	clusterRoles := []*rbacv1.ClusterRole{p.adminCR}
+	clusterRoleBindings := []*rbacv1.ClusterRoleBinding{
+		{
+			Subjects: []rbacv1.Subject{
+				{Kind: rbacv1.UserKind, Name: adminUser},
+			},
+			RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: p.adminCR.Name},
+		},
+	}
+	resolver, _ := validation.NewTestRuleResolver(nil, nil, clusterRoles, clusterRoleBindings)
+
+	ctrl := gomock.NewController(p.T())
+	roleTemplateCache := fake.NewMockNonNamespacedCacheInterface[*apisv3.RoleTemplate](ctrl)
+	roleTemplateCache.EXPECT().Get(p.adminRT.Name).Return(p.adminRT, nil).AnyTimes()
+	roleTemplateCache.EXPECT().Get(missingRT).Return(nil, apierrors.NewNotFound(schema.GroupResource{
+		Group:    "management.cattle.io",
+		Resource: "roletemplates",
+	}, missingRT)).AnyTimes()
+	roleTemplateCache.EXPECT().Get(inheritsMissingRT).Return(&apisv3.RoleTemplate{
+		ObjectMeta:        metav1.ObjectMeta{Name: inheritsMissingRT},
+		RoleTemplateNames: []string{missingRT},
+		Context:           p.adminRT.Context,
+	}, nil).AnyTimes()
+	roleTemplateCache.EXPECT().Get(errorRT).Return(nil, errExpected).AnyTimes()
+	roleTemplateCache.EXPECT().Get(externalMissingCRRT).Return(&apisv3.RoleTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: externalMissingCRRT},
+		External:   true,
+		Context:    p.adminRT.Context,
+	}, nil).AnyTimes()
+	roleTemplateCache.EXPECT().List(gomock.Any()).Return([]*apisv3.RoleTemplate{p.adminRT}, nil).AnyTimes()
+	clusterRoleCache := fake.NewMockNonNamespacedCacheInterface[*rbacv1.ClusterRole](ctrl)
+	clusterRoleCache.EXPECT().Get(externalMissingCRRT).Return(nil, apierrors.NewNotFound(schema.GroupResource{
+		Group:    "rbac.authorization.k8s.io",
+		Resource: "clusterroles",
+	}, externalMissingCRRT)).AnyTimes()
+	roleResolver := auth.NewRoleTemplateResolver(roleTemplateCache, clusterRoleCache)
+	prtbCache := fake.NewMockCacheInterface[*apisv3.ProjectRoleTemplateBinding](ctrl)
+	prtbCache.EXPECT().AddIndexer(gomock.Any(), gomock.Any()).Times(2)
+	prtbCache.EXPECT().GetByIndex(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+	crtbCache := fake.NewMockCacheInterface[*apisv3.ClusterRoleTemplateBinding](ctrl)
+	crtbCache.EXPECT().AddIndexer(gomock.Any(), gomock.Any())
+	crtbCache.EXPECT().GetByIndex(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+	crtbResolver := resolvers.NewCRTBRuleResolver(crtbCache, roleResolver)
+	prtbResolver := resolvers.NewPRTBRuleResolver(prtbCache, roleResolver)
+	clusterCache := fake.NewMockNonNamespacedCacheInterface[*apisv3.Cluster](ctrl)
+	clusterCache.EXPECT().Get(clusterID).Return(&apisv3.Cluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: clusterID,
+		},
+	}, nil).AnyTimes()
+
+	projectCache := fake.NewMockCacheInterface[*apisv3.Project](ctrl)
+	projectCache.EXPECT().Get(clusterID, projectID).Return(&apisv3.Project{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: clusterID,
+			Name:      projectID,
+		},
+		Spec: apisv3.ProjectSpec{
+			ClusterName: clusterID,
+		},
+	}, nil).AnyTimes()
+
+	validator := projectroletemplatebinding.NewValidator(prtbResolver, crtbResolver, resolvers.NewPRTBClusterScopedRuleResolver(prtbCache, roleResolver), resolver, roleResolver, clusterCache, projectCache, prtbCache)
+	type args struct {
+		oldPRTB  func() *apisv3.ProjectRoleTemplateBinding
+		newPRTB  func() *apisv3.ProjectRoleTemplateBinding
+		username string
+	}
+	tests := []struct {
+		name    string
+		args    args
+		wantErr bool
+		allowed bool
+	}{
+		{
+			name: "base test valid PRTB update",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.Name = "oldName"
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.Name = "newName"
+					return basePRTB
+				},
+			},
+			allowed: true,
+		},
+		{
+			name: "update role template",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.RoleTemplateName = p.readNodesRT.Name
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "update service account",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.ServiceAccount = "default"
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "update previously set user",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = "testuser1"
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = newUser
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "update removing a previously set service account",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = ""
+					basePRTB.ServiceAccount = "p1:default"
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = ""
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "update previously set service account",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = ""
+					basePRTB.ServiceAccount = "p1:default"
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = ""
+					basePRTB.ServiceAccount = "p1:another"
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "set a previously unset service account with a user name already present",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.ServiceAccount = "p1:another"
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "update previously unset user",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = ""
+					basePRTB.UserPrincipalName = newUserPrinc
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = newUser
+					basePRTB.UserPrincipalName = newUserPrinc
+					return basePRTB
+				},
+			},
+			allowed: true,
+		},
+		{
+			name: "update previously unset user and set group",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = ""
+					basePRTB.GroupName = testGroup
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = newUser
+					basePRTB.GroupName = testGroup
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "update previously set user principal",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserPrincipalName = "local://testuser1"
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserPrincipalName = newUserPrinc
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "update previously set group",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = ""
+					basePRTB.GroupName = testGroup
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = ""
+					basePRTB.GroupName = ""
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "update previously unset group with no previously set user",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = ""
+					basePRTB.GroupName = ""
+					basePRTB.GroupPrincipalName = "local://testgroup"
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = ""
+					basePRTB.GroupName = testGroup
+					basePRTB.GroupPrincipalName = "local://testgroup"
+					return basePRTB
+				},
+			},
+			allowed: true,
+		},
+		{
+			name: "update previously unset group",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = "testuser"
+					basePRTB.GroupName = ""
+					basePRTB.GroupPrincipalName = ""
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = "testuser"
+					basePRTB.GroupName = testGroup
+					basePRTB.GroupPrincipalName = ""
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "update previously set group principal",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = ""
+					basePRTB.GroupPrincipalName = "local://testuser1"
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = ""
+					basePRTB.GroupPrincipalName = newUserPrinc
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "update previously unset user principal",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = ""
+					basePRTB.GroupName = testGroup
+					basePRTB.GroupPrincipalName = ""
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = ""
+					basePRTB.GroupName = testGroup
+					basePRTB.UserPrincipalName = "local://newGroup"
+					return basePRTB
+				},
+			},
+			allowed: true,
+		},
+		{
+			name: "update previously set project name",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.ProjectName = "newName"
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "remove finalizer while deleting with missing role template",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.RoleTemplateName = missingRT
+					basePRTB.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+					basePRTB.Finalizers = []string{"controller.cattle.io/mgmt-auth-prtb-controller"}
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.RoleTemplateName = missingRT
+					basePRTB.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+					return basePRTB
+				},
+			},
+			allowed: true,
+		},
+		{
+			name: "update immutable field while deleting",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+					basePRTB.ProjectName = "newName"
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "update with missing role template",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.RoleTemplateName = missingRT
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.RoleTemplateName = missingRT
+					basePRTB.Labels = map[string]string{"foo": "bar"}
+					return basePRTB
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "remove finalizer while deleting by user with role template rules",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+					basePRTB.Finalizers = []string{"controller.cattle.io/mgmt-auth-prtb-controller"}
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+					return basePRTB
+				},
+			},
+			allowed: true,
+		},
+		{
+			name: "remove finalizer while deleting by user without role template rules",
+			args: args{
+				username: noRulesUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+					basePRTB.Finalizers = []string{"controller.cattle.io/mgmt-auth-prtb-controller"}
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "remove finalizer while deleting with missing inherited role template",
+			args: args{
+				username: noRulesUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.RoleTemplateName = inheritsMissingRT
+					basePRTB.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+					basePRTB.Finalizers = []string{"controller.cattle.io/mgmt-auth-prtb-controller"}
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.RoleTemplateName = inheritsMissingRT
+					basePRTB.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+					return basePRTB
+				},
+			},
+			allowed: true,
+		},
+		{
+			name: "remove finalizer while deleting with role template lookup error",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.RoleTemplateName = errorRT
+					basePRTB.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+					basePRTB.Finalizers = []string{"controller.cattle.io/mgmt-auth-prtb-controller"}
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.RoleTemplateName = errorRT
+					basePRTB.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+					return basePRTB
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "remove finalizer while deleting with missing external cluster role",
+			args: args{
+				username: noRulesUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.RoleTemplateName = externalMissingCRRT
+					basePRTB.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+					basePRTB.Finalizers = []string{"controller.cattle.io/mgmt-auth-prtb-controller"}
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.RoleTemplateName = externalMissingCRRT
+					basePRTB.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+					return basePRTB
+				},
+			},
+			allowed: true,
+		},
+		{
+			name: "update with missing external cluster role",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.RoleTemplateName = externalMissingCRRT
+					return basePRTB
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.RoleTemplateName = externalMissingCRRT
+					basePRTB.Labels = map[string]string{"foo": "bar"}
+					return basePRTB
+				},
+			},
+			wantErr: true,
+		},
+	}
+
+	for i := range tests {
+		test := tests[i]
+		p.Run(test.name, func() {
+			p.T().Parallel()
+			req := createPRTBRequest(p.T(), test.args.oldPRTB(), test.args.newPRTB(), test.args.username)
+			admitters := validator.Admitters()
+			p.Len(admitters, 1)
+			resp, err := admitters[0].Admit(req)
+			if test.wantErr {
+				p.Require().Error(err)
+				p.Require().Nil(resp)
+				return
+			}
+			p.NoError(err, "Admit failed")
+			if resp.Allowed != test.allowed {
+				p.Failf("Response was incorrectly validated", "Wanted response.Allowed = '%v' got %v: result=%+v", test.allowed, resp.Allowed, resp.Result)
+			}
+		})
+	}
+}
+
+func (p *ProjectRoleTemplateBindingSuite) TestValidationOnCreate() {
+	type testState struct {
+		clusterRoleCacheMock *fake.MockNonNamespacedCacheInterface[*rbacv1.ClusterRole]
+	}
+	ctrl := gomock.NewController(p.T())
+	const adminUser = "admin-userid"
+	const writeNodeUser = "write-node-userid"
+	const readPodUser = "read-pod-userid"
+	const badRoleTemplateName = "bad-roletemplate"
+	const missingCluster = "missing-cluster"
+	const nilCluster = "nil-cluster"
+	const errCluster = "error-cluster"
+	const missingProject = "missing-project"
+	const nilProject = "nil-project"
+	const errProject = "error-project"
+	const badSpecProject = "bad-spec"
+	clusterRoles := []*rbacv1.ClusterRole{p.adminCR, p.writeNodeCR, p.readPodsCR}
+	clusterRoleBindings := []*rbacv1.ClusterRoleBinding{
+		{
+			Subjects: []rbacv1.Subject{
+				{Kind: rbacv1.UserKind, Name: adminUser},
+			},
+			RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: p.adminCR.Name},
+		},
+		{
+			Subjects: []rbacv1.Subject{
+				{Kind: rbacv1.UserKind, Name: writeNodeUser},
+			},
+			RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: p.writeNodeCR.Name},
+		},
+		{
+			Subjects: []rbacv1.Subject{
+				{Kind: rbacv1.UserKind, Name: readPodUser},
+			},
+			RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: p.readPodsCR.Name},
+		},
+	}
+
+	validatorWithMocks := func(state testState) *projectroletemplatebinding.Validator {
+		resolver, _ := validation.NewTestRuleResolver(nil, nil, clusterRoles, clusterRoleBindings)
+		roleTemplateCache := fake.NewMockNonNamespacedCacheInterface[*apisv3.RoleTemplate](ctrl)
+		roleTemplateCache.EXPECT().Get(p.adminRT.Name).Return(p.adminRT, nil).AnyTimes()
+		roleTemplateCache.EXPECT().Get(p.externalRulesWriteNodesRT.Name).Return(p.externalRulesWriteNodesRT, nil).AnyTimes()
+		roleTemplateCache.EXPECT().Get(p.externalClusterRoleRT.Name).Return(p.externalClusterRoleRT, nil).AnyTimes()
+		roleTemplateCache.EXPECT().Get(p.lockedRT.Name).Return(p.lockedRT, nil).AnyTimes()
+		roleTemplateCache.EXPECT().Get(p.clusterContextRT.Name).Return(p.clusterContextRT, nil).AnyTimes()
+		roleTemplateCache.EXPECT().Get(badRoleTemplateName).Return(nil, errExpected).AnyTimes()
+		roleTemplateCache.EXPECT().Get("").Return(nil, errExpected).AnyTimes()
+		roleResolver := auth.NewRoleTemplateResolver(roleTemplateCache, state.clusterRoleCacheMock)
+		prtbCache := fake.NewMockCacheInterface[*apisv3.ProjectRoleTemplateBinding](ctrl)
+		prtbCache.EXPECT().AddIndexer(gomock.Any(), gomock.Any()).Times(2)
+		prtbCache.EXPECT().GetByIndex(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+		prtbCache.EXPECT().List(gomock.Any(), gomock.Any()).Return([]*apisv3.ProjectRoleTemplateBinding{}, nil).AnyTimes()
+		crtbCache := fake.NewMockCacheInterface[*apisv3.ClusterRoleTemplateBinding](ctrl)
+		crtbCache.EXPECT().AddIndexer(gomock.Any(), gomock.Any())
+		crtbCache.EXPECT().GetByIndex(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+		crtbResolver := resolvers.NewCRTBRuleResolver(crtbCache, roleResolver)
+		prtbResolver := resolvers.NewPRTBRuleResolver(prtbCache, roleResolver)
+
+		clusterCache := fake.NewMockNonNamespacedCacheInterface[*apisv3.Cluster](ctrl)
+		clusterCache.EXPECT().Get(clusterID).Return(&apisv3.Cluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: clusterID,
+			},
+		}, nil).AnyTimes()
+		clusterCache.EXPECT().Get(nilCluster).Return(nil, nil).AnyTimes()
+		clusterCache.EXPECT().Get(errCluster).Return(nil, fmt.Errorf("server not available")).AnyTimes()
+		clusterCache.EXPECT().Get(missingCluster).Return(nil, apierrors.NewNotFound(schema.GroupResource{
+			Group:    "management.cattle.io",
+			Resource: "clusters",
+		}, missingCluster)).AnyTimes()
+
+		projectCache := fake.NewMockCacheInterface[*apisv3.Project](ctrl)
+		projectCache.EXPECT().Get(clusterID, projectID).Return(&apisv3.Project{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: clusterID,
+				Name:      projectID,
+			},
+			Spec: apisv3.ProjectSpec{
+				ClusterName: clusterID,
+			},
+		}, nil).AnyTimes()
+		projectCache.EXPECT().Get(clusterID, nilProject).Return(nil, nil).AnyTimes()
+		projectCache.EXPECT().Get(clusterID, errProject).Return(nil, fmt.Errorf("server not available")).AnyTimes()
+		projectCache.EXPECT().Get(clusterID, missingProject).Return(nil, apierrors.NewNotFound(schema.GroupResource{
+			Group:    "management.cattle.io",
+			Resource: "projects",
+		}, missingProject)).AnyTimes()
+
+		projectCache.EXPECT().Get(clusterID, badSpecProject).Return(&apisv3.Project{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: clusterID,
+				Name:      projectID,
+			},
+			Spec: apisv3.ProjectSpec{
+				ClusterName: missingCluster,
+			},
+		}, nil).AnyTimes()
+
+		return projectroletemplatebinding.NewValidator(prtbResolver, crtbResolver, resolvers.NewPRTBClusterScopedRuleResolver(prtbCache, roleResolver), resolver, roleResolver, clusterCache, projectCache, prtbCache)
+	}
+
+	type args struct {
+		oldPRTB  func() *apisv3.ProjectRoleTemplateBinding
+		newPRTB  func() *apisv3.ProjectRoleTemplateBinding
+		username string
+	}
+	tests := []struct {
+		name       string
+		args       args
+		wantErr    bool
+		allowed    bool
+		stateSetup func(state testState)
+	}{
+		{
+			name: "base test valid PRTB creation",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					return nil
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					return basePRTB
+				},
+			},
+			allowed: true,
+		},
+		{
+			name: "missing role template",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					return nil
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.RoleTemplateName = ""
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "setting service account",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					return nil
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = ""
+					basePRTB.ServiceAccount = "default"
+					return basePRTB
+				},
+			},
+			allowed: true,
+		},
+		{
+			name: "setting a non project role template context",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					return nil
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.RoleTemplateName = "cluster-member"
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "neither user nor group nor service account subject is set",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					return nil
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = ""
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "both user and group set",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					return nil
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = "newUser"
+					basePRTB.GroupName = "newGroup"
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "both user and service account set",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					return nil
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = "newUser"
+					basePRTB.ServiceAccount = "sa"
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "both group and service account set",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					return nil
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.UserName = ""
+					basePRTB.GroupName = "newGroup"
+					basePRTB.ServiceAccount = "sa"
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "bad role template name",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					return nil
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.RoleTemplateName = badRoleTemplateName
+					return basePRTB
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "locked role template",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					return nil
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.RoleTemplateName = p.lockedRT.Name
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "unset project name",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					return nil
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.ProjectName = ""
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "missing cluster name",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					return nil
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.ProjectName = fmt.Sprintf(":%s", projectID)
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "missing project name",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					return nil
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.ProjectName = fmt.Sprintf("%s:", clusterID)
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+
+		{
+			name: "missing cluster",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					return nil
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.ProjectName = fmt.Sprintf("%s:%s", missingCluster, projectID)
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "err when retrieving cluster",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					return nil
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.ProjectName = fmt.Sprintf("%s:%s", errCluster, projectID)
+					return basePRTB
+				},
+			},
+			allowed: false,
+			wantErr: true,
+		},
+		{
+			name: "nil return cluster",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					return nil
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.ProjectName = fmt.Sprintf("%s:%s", nilCluster, projectID)
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "missing project",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					return nil
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.Namespace = missingProject
+					basePRTB.ProjectName = fmt.Sprintf("%s:%s", clusterID, missingProject)
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "err when retrieving project",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					return nil
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.Namespace = errProject
+					basePRTB.ProjectName = fmt.Sprintf("%s:%s", clusterID, errProject)
+					return basePRTB
+				},
+			},
+			allowed: false,
+			wantErr: true,
+		},
+		{
+			name: "nil project",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					return nil
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.Namespace = nilProject
+					basePRTB.ProjectName = fmt.Sprintf("%s:%s", clusterID, nilProject)
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "project spec cluster name does not match cluster",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					return nil
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.Namespace = badSpecProject
+					basePRTB.ProjectName = fmt.Sprintf("%s:%s", clusterID, badSpecProject)
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "bad format projectName",
+			args: args{
+				username: adminUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					return nil
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.ProjectName = "default"
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+		{
+			name: "external RT with externalRules valid PRTB creation",
+			args: args{
+				username: writeNodeUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					return nil
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.RoleTemplateName = "external-rule-write-nodes"
+
+					return basePRTB
+				},
+			},
+			allowed: true,
+		},
+		{
+			name: "external RT with externalRules not created when there are not enough permissions",
+			args: args{
+				username: readPodUser,
+				oldPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					return nil
+				},
+				newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+					basePRTB := newBasePRTB()
+					basePRTB.RoleTemplateName = "external-rule-write-nodes"
+
+					return basePRTB
+				},
+			},
+			allowed: false,
+		},
+	}
+
+	for i := range tests {
+		test := tests[i]
+		p.Run(test.name, func() {
+			p.T().Parallel()
+			req := createPRTBRequest(p.T(), test.args.oldPRTB(), test.args.newPRTB(), test.args.username)
+			clusterRoleCache := fake.NewMockNonNamespacedCacheInterface[*rbacv1.ClusterRole](ctrl)
+			state := testState{
+				clusterRoleCacheMock: clusterRoleCache,
+			}
+			if test.stateSetup != nil {
+				test.stateSetup(state)
+			}
+			validator := validatorWithMocks(state)
+			admitters := validator.Admitters()
+			p.Len(admitters, 1)
+			resp, err := admitters[0].Admit(req)
+			if test.wantErr {
+				p.Require().Error(err)
+				p.Require().Nil(resp)
+				return
+			}
+			p.Require().NoError(err, "Admit failed")
+			if resp.Allowed != test.allowed {
+				p.Failf("Response was incorrectly validated", "Wanted response.Allowed = %v got %v: result=%+v", test.allowed, resp.Allowed, resp.Result)
+			}
+		})
+	}
+}
+
+func (p *ProjectRoleTemplateBindingSuite) TestValidateDuplicates() {
+	const adminUser = "admin-userid"
+	const memberRole = "read-role"
+
+	tests := []struct {
+		name           string
+		setupPRTBMocks func(prtbCache *fake.MockCacheInterface[*apisv3.ProjectRoleTemplateBinding])
+		newPRTB        *apisv3.ProjectRoleTemplateBinding
+		allowed        bool
+	}{
+		{
+			name: "no duplicate exists",
+			setupPRTBMocks: func(prtbCache *fake.MockCacheInterface[*apisv3.ProjectRoleTemplateBinding]) {
+				prtbCache.EXPECT().List(gomock.Any(), gomock.Any()).Return([]*apisv3.ProjectRoleTemplateBinding{}, nil).AnyTimes()
+			},
+			newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+				prtb := newBasePRTB()
+				prtb.RoleTemplateName = memberRole
+				return prtb
+			}(),
+			allowed: true,
+		},
+		{
+			name: "exact duplicate exists",
+			setupPRTBMocks: func(prtbCache *fake.MockCacheInterface[*apisv3.ProjectRoleTemplateBinding]) {
+				existing := newBasePRTB()
+				existing.Name = "existing-prtb"
+				existing.RoleTemplateName = memberRole
+				prtbCache.EXPECT().List(gomock.Any(), gomock.Any()).Return([]*apisv3.ProjectRoleTemplateBinding{existing}, nil).AnyTimes()
+			},
+			newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+				prtb := newBasePRTB()
+				prtb.RoleTemplateName = memberRole
+				return prtb
+			}(),
+			allowed: false,
+		},
+		{
+			name: "duplicate exists but is being deleted",
+			setupPRTBMocks: func(prtbCache *fake.MockCacheInterface[*apisv3.ProjectRoleTemplateBinding]) {
+				deleting := newBasePRTB()
+				deleting.Name = "deleting-prtb"
+				deleting.RoleTemplateName = memberRole
+				deleting.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+				prtbCache.EXPECT().List(gomock.Any(), gomock.Any()).Return([]*apisv3.ProjectRoleTemplateBinding{deleting}, nil).AnyTimes()
+			},
+			newPRTB: func() *apisv3.ProjectRoleTemplateBinding {
+				prtb := newBasePRTB()
+				prtb.RoleTemplateName = memberRole
+				return prtb
+			}(),
+			allowed: true,
+		},
+	}
+
+	for _, test := range tests {
+		p.Run(test.name, func() {
+			subCtrl := gomock.NewController(p.T())
+			defer subCtrl.Finish()
+
+			prtbCache := fake.NewMockCacheInterface[*apisv3.ProjectRoleTemplateBinding](subCtrl)
+			prtbCache.EXPECT().AddIndexer(gomock.Any(), gomock.Any()).AnyTimes()
+			prtbCache.EXPECT().GetByIndex(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+			test.setupPRTBMocks(prtbCache)
+
+			roleTemplate := &apisv3.RoleTemplate{
+				ObjectMeta: metav1.ObjectMeta{Name: memberRole},
+				Context:    "project",
+			}
+			roleTemplateCache := fake.NewMockNonNamespacedCacheInterface[*apisv3.RoleTemplate](subCtrl)
+			roleTemplateCache.EXPECT().Get(memberRole).Return(roleTemplate, nil).AnyTimes()
+			roleResolver := auth.NewRoleTemplateResolver(roleTemplateCache, nil)
+
+			crtbCache := fake.NewMockCacheInterface[*apisv3.ClusterRoleTemplateBinding](subCtrl)
+			crtbCache.EXPECT().AddIndexer(gomock.Any(), gomock.Any()).AnyTimes()
+			crtbCache.EXPECT().GetByIndex(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+
+			clusterCache := fake.NewMockNonNamespacedCacheInterface[*apisv3.Cluster](subCtrl)
+			clusterCache.EXPECT().Get(clusterID).Return(&apisv3.Cluster{
+				ObjectMeta: metav1.ObjectMeta{Name: clusterID},
+			}, nil).AnyTimes()
+
+			projectCache := fake.NewMockCacheInterface[*apisv3.Project](subCtrl)
+			projectCache.EXPECT().Get(clusterID, projectID).Return(&apisv3.Project{
+				ObjectMeta: metav1.ObjectMeta{Namespace: clusterID, Name: projectID},
+				Spec:       apisv3.ProjectSpec{ClusterName: clusterID},
+			}, nil).AnyTimes()
+
+			crtbResolver := resolvers.NewCRTBRuleResolver(crtbCache, roleResolver)
+			prtbResolver := resolvers.NewPRTBRuleResolver(prtbCache, roleResolver)
+
+			dummyDefaultResolver, _ := validation.NewTestRuleResolver(nil, nil, nil, nil)
+			validator := projectroletemplatebinding.NewValidator(prtbResolver, crtbResolver, resolvers.NewPRTBClusterScopedRuleResolver(prtbCache, roleResolver), dummyDefaultResolver, roleResolver, clusterCache, projectCache, prtbCache)
+
+			req := createPRTBRequest(p.T(), nil, test.newPRTB, adminUser)
+			admitters := validator.Admitters()
+			p.Require().NotEmpty(admitters)
+			resp, err := admitters[0].Admit(req)
+
+			p.NoError(err)
+			if test.allowed {
+				p.True(resp.Allowed)
+			} else {
+				p.False(resp.Allowed)
+				p.Contains(resp.Result.Message, "duplicate prtb not allowed")
+			}
+		})
+	}
+}
+
+// createPRTBRequest will return a new webhookRequest with the using the given PRTBs
+// if oldPRTB is nil then a request will be returned as a create operation.
+// else the request will look like ana update operation.
+func createPRTBRequest(t *testing.T, oldPRTB, newPRTB *apisv3.ProjectRoleTemplateBinding, username string) *admission.Request {
+	t.Helper()
+	gvk := metav1.GroupVersionKind{Group: "management.cattle.io", Version: "v3", Kind: "ProjectRoleTemplateBinding"}
+	gvr := metav1.GroupVersionResource{Group: "management.cattle.io", Version: "v3", Resource: "projectroletemplatebindings"}
+	req := &admission.Request{
+		AdmissionRequest: v1.AdmissionRequest{
+			UID:             "1",
+			Kind:            gvk,
+			Resource:        gvr,
+			RequestKind:     &gvk,
+			RequestResource: &gvr,
+			Name:            newPRTB.Name,
+			Namespace:       newPRTB.Namespace,
+			Operation:       v1.Create,
+			UserInfo:        v1authentication.UserInfo{Username: username, UID: ""},
+			Object:          runtime.RawExtension{},
+			OldObject:       runtime.RawExtension{},
+		},
+		Context: context.Background(),
+	}
+	var err error
+	req.Object.Raw, err = json.Marshal(newPRTB)
+	assert.NoError(t, err, "Failed to marshal PRTB while creating request")
+	if oldPRTB != nil {
+		req.Operation = v1.Update
+		req.OldObject.Raw, err = json.Marshal(oldPRTB)
+		assert.NoError(t, err, "Failed to marshal PRTB while creating request")
+	}
+
+	return req
+}
+
+func newBasePRTB() *apisv3.ProjectRoleTemplateBinding {
+	return &apisv3.ProjectRoleTemplateBinding{
+		TypeMeta: metav1.TypeMeta{Kind: "ProjectRoleTemplateBinding", APIVersion: "management.cattle.io/v3"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "PRTB-new",
+			GenerateName:      "PRTB-",
+			Namespace:         projectID,
+			UID:               "6534e4ef-f07b-4c61-b88d-95a92cce4852",
+			ResourceVersion:   "1",
+			Generation:        1,
+			CreationTimestamp: metav1.Time{},
+			ManagedFields:     []metav1.ManagedFieldsEntry{},
+		},
+		UserName:         "user1",
+		RoleTemplateName: "admin-role",
+		ProjectName:      fmt.Sprintf("%s:%s", clusterID, projectID),
+	}
+}

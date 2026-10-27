@@ -1,0 +1,4556 @@
+package cluster
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"slices"
+	"strings"
+	"testing"
+
+	jsonpatch "github.com/evanphx/json-patch"
+	v3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
+	v1 "github.com/rancher/rancher/pkg/apis/provisioning.cattle.io/v1"
+	rkev1 "github.com/rancher/rancher/pkg/apis/rke.cattle.io/v1"
+	"github.com/rancher/rancher/pkg/webhook/clients"
+	"github.com/rancher/rancher/pkg/webhook/resources/common"
+	"github.com/rancher/webhook/pkg/admission"
+	"github.com/rancher/wrangler/v3/pkg/generic/fake"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+	admissionv1 "k8s.io/api/admission/v1"
+	authenticationv1 "k8s.io/api/authentication/v1"
+	authv1 "k8s.io/api/authorization/v1"
+	k8sv1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
+	authorizationv1 "k8s.io/client-go/kubernetes/typed/authorization/v1"
+	"k8s.io/client-go/rest"
+	restfake "k8s.io/client-go/rest/fake"
+	k8stesting "k8s.io/client-go/testing"
+)
+
+func newTestSourceAuthorizer(t *testing.T, client authorizationv1.AuthorizationV1Interface) authorizer.Authorizer {
+	t.Helper()
+	// The authorizer uses RESTClient(), which k8sfake leaves empty. Forward REST calls to its reactors.
+	cfg := &rest.Config{
+		Host: "https://sar-test.invalid",
+		Transport: restfake.CreateHTTPClient(func(request *http.Request) (*http.Response, error) {
+			if request.Method != http.MethodPost || request.URL.Path != "/apis/authorization.k8s.io/v1/subjectaccessreviews" {
+				return nil, fmt.Errorf("unexpected request: %s %s", request.Method, request.URL.Path)
+			}
+			review := &authv1.SubjectAccessReview{}
+			if err := json.NewDecoder(request.Body).Decode(review); err != nil {
+				return nil, err
+			}
+			result, err := client.SubjectAccessReviews().Create(request.Context(), review, metav1.CreateOptions{})
+			if err != nil {
+				// Reactor errors reach the authorizer as transport errors, which still unwrap to the API error.
+				return nil, err
+			}
+			body, err := json.Marshal(result)
+			if err != nil {
+				return nil, err
+			}
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}},
+				Body: io.NopCloser(bytes.NewReader(body))}, nil
+		}).Transport,
+	}
+	// Use the production constructor and settings, without informer watches. Each case gets its own cache.
+	sharedClients, err := clients.NewWithOptions(context.Background(), cfg, &clients.Options{StartCache: false})
+	require.NoError(t, err)
+	return sharedClients.Authorizer
+}
+
+func TestAdmitMachineSelectorFilesAccess(t *testing.T) {
+	file := func(secret, configmap string) rkev1.RKEProvisioningFiles {
+		return rkev1.RKEProvisioningFiles{FileSources: []rkev1.ProvisioningFileSource{{
+			Secret:    rkev1.K8sObjectFileSource{Name: secret, Items: []rkev1.KeyToPath{{Key: "config", Path: "/etc/config"}}},
+			ConfigMap: rkev1.K8sObjectFileSource{Name: configmap},
+		}}}
+	}
+	denied := file("denied", "")
+	allowed := file("allowed-secret", "")
+	allowedCM := file("", "allowed-cm")
+	sarError := errors.New("SAR unavailable")
+	readError := errors.New("source read unavailable")
+	selectorMessage := "changing cluster labels requires GET access to sources shared by cluster selector"
+	changeLabels := func(_, newCluster *v1.Cluster) { newCluster.Labels = map[string]string{"env": "dev"} }
+	tests := []struct {
+		name          string
+		operation     admissionv1.Operation
+		configure     func(oldCluster, newCluster *v1.Cluster)
+		wantSources   []string
+		wantMessage   string
+		wantDenied    bool
+		wantError     error
+		stored        map[string]map[string]string
+		wantReads     []string
+		dryRun        bool
+		checkIdentity bool
+	}{
+		{name: "create denied Secret", wantSources: []string{"secrets/denied"}, wantMessage: "secrets fleet-default/denied", wantDenied: true},
+		{
+			name: "create allowed Secret",
+			configure: func(_, newCluster *v1.Cluster) {
+				newCluster.Spec.RKEConfig.MachineSelectorFiles = []rkev1.RKEProvisioningFiles{allowed}
+			},
+			wantSources:   []string{"secrets/allowed-secret"},
+			checkIdentity: true,
+		},
+		{
+			name: "create denied ConfigMap",
+			configure: func(_, newCluster *v1.Cluster) {
+				newCluster.Spec.RKEConfig.MachineSelectorFiles = []rkev1.RKEProvisioningFiles{file("", "denied")}
+			},
+			wantSources: []string{"configmaps/denied"}, wantDenied: true,
+			wantMessage: "configmaps fleet-default/denied",
+		},
+		{name: "update identical denied source", operation: admissionv1.Update},
+		{
+			name: "update reorders unchanged entries", operation: admissionv1.Update,
+			configure: func(oldCluster, newCluster *v1.Cluster) {
+				oldCluster.Spec.RKEConfig.MachineSelectorFiles = append(oldCluster.Spec.RKEConfig.MachineSelectorFiles, file("another-denied", ""))
+				// Clone the slice so reversing the new list leaves the old order intact.
+				newCluster.Spec.RKEConfig.MachineSelectorFiles = slices.Clone(oldCluster.Spec.RKEConfig.MachineSelectorFiles)
+				slices.Reverse(newCluster.Spec.RKEConfig.MachineSelectorFiles)
+			},
+		},
+		{
+			name: "update removes entry without checking unchanged source", operation: admissionv1.Update,
+			configure: func(oldCluster, _ *v1.Cluster) {
+				// Only the old list has a second entry; the new list retains the unchanged denied entry.
+				oldCluster.Spec.RKEConfig.MachineSelectorFiles = append(oldCluster.Spec.RKEConfig.MachineSelectorFiles, file("another-denied", ""))
+			},
+		},
+		{
+			name: "update changes unrelated field", operation: admissionv1.Update,
+			configure: func(_, newCluster *v1.Cluster) {
+				newCluster.Spec.KubernetesVersion = "v1.34.2+rke2r1"
+			},
+		},
+		{
+			name:      "create without RKE config",
+			configure: func(_, newCluster *v1.Cluster) { newCluster.Spec.RKEConfig = nil },
+		},
+		{
+			name: "update changes path with denied source", operation: admissionv1.Update,
+			configure: func(_, newCluster *v1.Cluster) {
+				newCluster.Spec.RKEConfig.MachineSelectorFiles[0].FileSources[0].Secret.Items[0].Path = "/other"
+			},
+			wantSources: []string{"secrets/denied"}, wantMessage: "secrets fleet-default/denied", wantDenied: true,
+		},
+		{
+			name: "update changes only hash in ordinary entry", operation: admissionv1.Update,
+			configure: func(_, newCluster *v1.Cluster) {
+				newCluster.Spec.RKEConfig.MachineSelectorFiles[0].FileSources[0].Secret.Items[0].Hash = "other-hash"
+			},
+			wantSources: []string{"secrets/denied"}, wantMessage: "secrets fleet-default/denied", wantDenied: true,
+		},
+		{
+			name: "update changes machine selector with denied source", operation: admissionv1.Update,
+			configure: func(oldCluster, newCluster *v1.Cluster) {
+				oldCluster.Spec.RKEConfig.MachineSelectorFiles[0].MachineLabelSelector = &metav1.LabelSelector{
+					MatchLabels: map[string]string{"pool": "pool1"},
+				}
+				newCluster.Spec.RKEConfig.MachineSelectorFiles[0].MachineLabelSelector = &metav1.LabelSelector{
+					MatchLabels: map[string]string{"pool": "pool2"},
+				}
+			},
+			wantSources: []string{"secrets/denied"}, wantMessage: "secrets fleet-default/denied", wantDenied: true,
+		},
+		{
+			name: "label change checks unchanged selector Secret", operation: admissionv1.Update,
+			configure: changeLabels,
+			stored:    map[string]map[string]string{"secrets/denied": {authorizedObjectSelectorAnnotation: "env=dev"}},
+			wantReads: []string{"secrets/denied"}, wantSources: []string{"secrets/denied"},
+			wantDenied: true, wantMessage: selectorMessage,
+		},
+		{
+			name: "label change allows readable unchanged selector Secret", operation: admissionv1.Update,
+			configure: func(oldCluster, newCluster *v1.Cluster) {
+				oldCluster.Spec.RKEConfig.MachineSelectorFiles[0] = allowed
+				newCluster.Spec.RKEConfig.MachineSelectorFiles[0] = allowed
+				changeLabels(oldCluster, newCluster)
+			},
+			stored:    map[string]map[string]string{"secrets/allowed-secret": {authorizedObjectSelectorAnnotation: "env=dev"}},
+			wantReads: []string{"secrets/allowed-secret"}, wantSources: []string{"secrets/allowed-secret"},
+		},
+		{
+			name: "dry-run label change checks unchanged selector Secret", operation: admissionv1.Update,
+			configure: changeLabels, dryRun: true,
+			stored:    map[string]map[string]string{"secrets/denied": {authorizedObjectSelectorAnnotation: "env=dev"}},
+			wantReads: []string{"secrets/denied"}, wantSources: []string{"secrets/denied"},
+			wantDenied: true, wantMessage: selectorMessage,
+		},
+		{
+			name: "label change skips unchanged name-authorized Secret", operation: admissionv1.Update,
+			configure: changeLabels,
+			stored:    map[string]map[string]string{"secrets/denied": {"rke.cattle.io/object-authorized-for-clusters": "test-cluster"}},
+			wantReads: []string{"secrets/denied"},
+		},
+		{
+			name: "unrelated label change checks source even when selector does not match", operation: admissionv1.Update,
+			configure: func(oldCluster, newCluster *v1.Cluster) {
+				oldCluster.Labels = map[string]string{"env": "prod"}
+				newCluster.Labels = map[string]string{"env": "prod", "test": "test"}
+			},
+			stored:    map[string]map[string]string{"secrets/denied": {authorizedObjectSelectorAnnotation: "env=dev"}},
+			wantReads: []string{"secrets/denied"}, wantSources: []string{"secrets/denied"},
+			wantDenied: true, wantMessage: selectorMessage,
+		},
+		{
+			name: "label change checks source with both authorization annotations", operation: admissionv1.Update,
+			configure: changeLabels,
+			stored: map[string]map[string]string{"secrets/denied": {
+				authorizedObjectSelectorAnnotation: "env=dev", "rke.cattle.io/object-authorized-for-clusters": "test-cluster",
+			}},
+			wantReads: []string{"secrets/denied"}, wantSources: []string{"secrets/denied"},
+			wantDenied: true, wantMessage: selectorMessage,
+		},
+		{
+			name: "label change checks unchanged selector ConfigMap", operation: admissionv1.Update,
+			configure: func(oldCluster, newCluster *v1.Cluster) {
+				oldCluster.Spec.RKEConfig.MachineSelectorFiles[0] = file("", "denied")
+				newCluster.Spec.RKEConfig.MachineSelectorFiles[0] = file("", "denied")
+				changeLabels(oldCluster, newCluster)
+			},
+			stored:    map[string]map[string]string{"configmaps/denied": {authorizedObjectSelectorAnnotation: "env=dev"}},
+			wantReads: []string{"configmaps/denied"}, wantSources: []string{"configmaps/denied"},
+			wantDenied: true, wantMessage: selectorMessage,
+		},
+		{
+			name: "label change checks present empty selector", operation: admissionv1.Update,
+			configure: changeLabels,
+			stored:    map[string]map[string]string{"secrets/denied": {authorizedObjectSelectorAnnotation: ""}},
+			wantReads: []string{"secrets/denied"}, wantSources: []string{"secrets/denied"},
+			wantDenied: true, wantMessage: selectorMessage,
+		},
+		{
+			name: "label change skips missing unchanged source", operation: admissionv1.Update,
+			configure: changeLabels, wantReads: []string{"secrets/denied"},
+		},
+		{
+			name: "label change still checks missing changed source", operation: admissionv1.Update,
+			configure: func(oldCluster, newCluster *v1.Cluster) {
+				changeLabels(oldCluster, newCluster)
+				newCluster.Spec.RKEConfig.MachineSelectorFiles[0].FileSources[0].Secret.Items[0].Path = "/other"
+			},
+			wantSources: []string{"secrets/denied"},
+			wantDenied:  true, wantMessage: "secrets fleet-default/denied",
+		},
+		{
+			name: "label change fails on source read error", operation: admissionv1.Update,
+			configure: func(oldCluster, newCluster *v1.Cluster) {
+				oldCluster.Spec.RKEConfig.MachineSelectorFiles[0] = file("read-error", "")
+				newCluster.Spec.RKEConfig.MachineSelectorFiles[0] = file("read-error", "")
+				changeLabels(oldCluster, newCluster)
+			},
+			wantReads: []string{"secrets/read-error"}, wantError: readError,
+			wantMessage: "failed to read secrets fleet-default/read-error",
+		},
+		{
+			name: "label change checks shared changed and unchanged source once", operation: admissionv1.Update,
+			configure: func(oldCluster, newCluster *v1.Cluster) {
+				changeLabels(oldCluster, newCluster)
+				other := denied.DeepCopy()
+				other.FileSources[0].Secret.Items[0].Path = "/other"
+				newCluster.Spec.RKEConfig.MachineSelectorFiles = append(newCluster.Spec.RKEConfig.MachineSelectorFiles, *other)
+			},
+			wantSources: []string{"secrets/denied"},
+			wantDenied:  true, wantMessage: "secrets fleet-default/denied",
+		},
+		{
+			name: "label change checks newly added ConfigMap without reading it", operation: admissionv1.Update,
+			configure: func(oldCluster, newCluster *v1.Cluster) {
+				changeLabels(oldCluster, newCluster)
+				newCluster.Spec.RKEConfig.MachineSelectorFiles = append(newCluster.Spec.RKEConfig.MachineSelectorFiles, file("", "read-error"))
+			},
+			wantSources: []string{"configmaps/read-error"}, wantDenied: true,
+			wantMessage: "configmaps fleet-default/read-error",
+		},
+		{
+			name: "label change checks new unannotated and unchanged selector sources", operation: admissionv1.Update,
+			configure: func(oldCluster, newCluster *v1.Cluster) {
+				oldCluster.Spec.RKEConfig.MachineSelectorFiles[0] = allowed
+				newCluster.Spec.RKEConfig.MachineSelectorFiles[0] = allowed
+				newCluster.Spec.RKEConfig.MachineSelectorFiles = append(newCluster.Spec.RKEConfig.MachineSelectorFiles, allowedCM)
+				changeLabels(oldCluster, newCluster)
+			},
+			stored:      map[string]map[string]string{"secrets/allowed-secret": {authorizedObjectSelectorAnnotation: "env=dev"}},
+			wantReads:   []string{"secrets/allowed-secret"},
+			wantSources: []string{"configmaps/allowed-cm", "secrets/allowed-secret"},
+		},
+		{
+			name: "label change denies newly added selector source without label message", operation: admissionv1.Update,
+			configure: func(oldCluster, newCluster *v1.Cluster) {
+				oldCluster.Spec.RKEConfig.MachineSelectorFiles = nil
+				changeLabels(oldCluster, newCluster)
+			},
+			stored:      map[string]map[string]string{"secrets/denied": {authorizedObjectSelectorAnnotation: "env=dev"}},
+			wantSources: []string{"secrets/denied"},
+			wantDenied:  true, wantMessage: "secrets fleet-default/denied",
+		},
+		{
+			name: "adding allowed entry without label change skips unchanged selector source", operation: admissionv1.Update,
+			configure: func(_, newCluster *v1.Cluster) {
+				newCluster.Spec.RKEConfig.MachineSelectorFiles = append(newCluster.Spec.RKEConfig.MachineSelectorFiles, allowed)
+			},
+			stored:      map[string]map[string]string{"secrets/denied": {authorizedObjectSelectorAnnotation: "env=dev"}},
+			wantSources: []string{"secrets/allowed-secret"},
+		},
+		{
+			name: "create with labels checks every source without reads",
+			configure: func(_, newCluster *v1.Cluster) {
+				newCluster.Labels = map[string]string{"env": "dev"}
+				newCluster.Spec.RKEConfig.MachineSelectorFiles = []rkev1.RKEProvisioningFiles{allowed, allowedCM}
+			},
+			wantSources: []string{"secrets/allowed-secret", "configmaps/allowed-cm"},
+		},
+		{
+			name: "nil and empty cluster labels require no reads", operation: admissionv1.Update,
+			configure: func(_, newCluster *v1.Cluster) { newCluster.Labels = map[string]string{} },
+		},
+		{
+			name: "adding an allowed entry checks only its source during label edit", operation: admissionv1.Update,
+			configure: func(_, newCluster *v1.Cluster) {
+				newCluster.Labels = map[string]string{"env": "dev"}
+				newCluster.Spec.RKEConfig.MachineSelectorFiles = append(newCluster.Spec.RKEConfig.MachineSelectorFiles, allowed)
+			},
+			wantSources: []string{"secrets/allowed-secret"},
+			stored:      map[string]map[string]string{"secrets/denied": {"rke.cattle.io/object-authorized-for-clusters": "test-cluster"}},
+			wantReads:   []string{"secrets/denied"},
+		},
+		{
+			name: "multiple sources in one entry",
+			configure: func(_, newCluster *v1.Cluster) {
+				newCluster.Spec.RKEConfig.MachineSelectorFiles = []rkev1.RKEProvisioningFiles{{
+					FileSources: append(allowed.FileSources, allowedCM.FileSources...),
+				}}
+			},
+			wantSources: []string{"secrets/allowed-secret", "configmaps/allowed-cm"},
+		},
+		{
+			name:      "unchanged entry does not suppress check for newly added entry with same denied Secret",
+			operation: admissionv1.Update,
+			configure: func(_, newCluster *v1.Cluster) {
+				other := denied.DeepCopy()
+				// A different path makes this a new entry that still needs access to the same Secret.
+				other.FileSources[0].Secret.Items[0].Path = "/other"
+				newCluster.Spec.RKEConfig.MachineSelectorFiles = append(newCluster.Spec.RKEConfig.MachineSelectorFiles, *other)
+			},
+			wantSources: []string{"secrets/denied"}, wantMessage: "secrets fleet-default/denied", wantDenied: true,
+		},
+		{
+			name: "duplicate sources in different entries",
+			configure: func(_, newCluster *v1.Cluster) {
+				first := file("allowed-secret", "allowed-cm")
+				other := first.DeepCopy()
+				// Distinct entries share both sources, so each resource should receive only one SAR.
+				other.FileSources[0].Secret.Items[0].Path = "/other"
+				newCluster.Spec.RKEConfig.MachineSelectorFiles = []rkev1.RKEProvisioningFiles{first, *other}
+			},
+			wantSources: []string{"secrets/allowed-secret", "configmaps/allowed-cm"},
+		},
+		{
+			name: "Secret and ConfigMap with same name are checked separately",
+			configure: func(_, newCluster *v1.Cluster) {
+				newCluster.Spec.RKEConfig.MachineSelectorFiles = []rkev1.RKEProvisioningFiles{file("allowed-shared", "allowed-shared")}
+			},
+			wantSources: []string{"secrets/allowed-shared", "configmaps/allowed-shared"},
+		},
+		{
+			name: "empty source names skipped",
+			configure: func(_, newCluster *v1.Cluster) {
+				newCluster.Spec.RKEConfig.MachineSelectorFiles = []rkev1.RKEProvisioningFiles{file("", "")}
+			},
+		},
+		{
+			name: "stop at first denial",
+			configure: func(_, newCluster *v1.Cluster) {
+				newCluster.Spec.RKEConfig.MachineSelectorFiles = []rkev1.RKEProvisioningFiles{allowed, denied, allowedCM}
+			},
+			wantSources: []string{"secrets/allowed-secret", "secrets/denied"}, wantDenied: true,
+			wantMessage: "secrets fleet-default/denied",
+		},
+		{
+			name: "SAR error fails closed",
+			configure: func(_, newCluster *v1.Cluster) {
+				newCluster.Spec.RKEConfig.MachineSelectorFiles = []rkev1.RKEProvisioningFiles{file("sar-error", ""), allowed}
+			},
+			wantSources: []string{"secrets/sar-error"}, wantError: sarError,
+		},
+		{name: "dry-run still checks source access", dryRun: true, wantSources: []string{"secrets/denied"}, wantMessage: "secrets fleet-default/denied", wantDenied: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Build a create request by default; update cases need the previous object too.
+			operation := tt.operation
+			if operation == "" {
+				operation = admissionv1.Create
+			}
+			// Each case starts with one denied Secret entry, unchanged unless configure edits it.
+			newCluster := &v1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "fleet-default", Annotations: map[string]string{common.CreatorIDAnn: "alice"}},
+				Spec: v1.ClusterSpec{KubernetesVersion: "v1.34.1+rke2r1", RKEConfig: &v1.RKEConfig{
+					ClusterConfiguration: rkev1.ClusterConfiguration{MachineSelectorFiles: []rkev1.RKEProvisioningFiles{*denied.DeepCopy()}},
+				}},
+			}
+			// Keep independent old/new objects so configure can describe exactly what changed.
+			oldCluster := newCluster.DeepCopy()
+			if tt.configure != nil {
+				tt.configure(oldCluster, newCluster)
+			}
+			raw, err := json.Marshal(newCluster)
+			require.NoError(t, err)
+			oldRaw, err := json.Marshal(oldCluster)
+			require.NoError(t, err)
+			request := &admission.Request{
+				Context: context.Background(),
+				AdmissionRequest: admissionv1.AdmissionRequest{
+					Operation: operation, Namespace: newCluster.Namespace,
+					UserInfo: authenticationv1.UserInfo{Username: "alice", UID: "alice-uid", Groups: []string{"developers"}, Extra: map[string]authenticationv1.ExtraValue{"scope": {"clusters"}}},
+					Object:   runtime.RawExtension{Raw: raw},
+				},
+			}
+			if operation == admissionv1.Update {
+				request.OldObject.Raw = oldRaw
+			}
+			// Send the dry-run flag through Admit to verify that it still performs access checks.
+			if tt.dryRun {
+				request.DryRun = admission.Ptr(true)
+			}
+			client := k8sfake.NewSimpleClientset()
+			// Names starting with "allowed" pass; "sar-error" returns an error; all others are denied.
+			client.PrependReactor("create", "subjectaccessreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
+				review := action.(k8stesting.CreateAction).GetObject().(*authv1.SubjectAccessReview)
+				if review.Spec.ResourceAttributes.Name == "sar-error" {
+					return true, nil, sarError
+				}
+				return true, &authv1.SubjectAccessReview{Status: authv1.SubjectAccessReviewStatus{
+					Allowed: strings.HasPrefix(review.Spec.ResourceAttributes.Name, "allowed"),
+				}}, nil
+			})
+			// Satisfy the other validators so each case reaches the machineSelectorFiles check.
+			ctrl := gomock.NewController(t)
+			mgmtClient := fake.NewMockNonNamespacedClientInterface[*v3.Cluster, *v3.ClusterList](ctrl)
+			if operation == admissionv1.Create {
+				// Creation checks for a conflicting management cluster; updates skip that lookup.
+				mgmtClient.EXPECT().Get(newCluster.Name, gomock.Any()).Return(nil, apierrors.NewNotFound(schema.GroupResource{Resource: "clusters"}, newCluster.Name))
+			}
+			secretCache := fake.NewMockCacheInterface[*k8sv1.Secret](ctrl)
+			// These cases select no PSACT; its validator expects the generated Secret to be absent.
+			secretCache.EXPECT().Get(newCluster.Namespace, "test-cluster-admission-configuration-psact").Return(nil,
+				apierrors.NewNotFound(k8sv1.Resource("secrets"), "test-cluster-admission-configuration-psact")).AnyTimes()
+			// Stored keys simulate existing sources; absent keys return NotFound and read-error fails.
+			var reads []string
+			secretClient := fake.NewMockControllerInterface[*k8sv1.Secret, *k8sv1.SecretList](ctrl)
+			secretClient.EXPECT().Get(newCluster.Namespace, gomock.Any(), metav1.GetOptions{}).DoAndReturn(
+				func(namespace, name string, _ metav1.GetOptions) (*k8sv1.Secret, error) {
+					key := "secrets/" + name
+					reads = append(reads, key)
+					if name == "read-error" {
+						return nil, readError
+					}
+					annotations, found := tt.stored[key]
+					if !found {
+						return nil, apierrors.NewNotFound(k8sv1.Resource("secrets"), name)
+					}
+					return &k8sv1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Annotations: annotations}}, nil
+				}).AnyTimes()
+			configMapClient := fake.NewMockControllerInterface[*k8sv1.ConfigMap, *k8sv1.ConfigMapList](ctrl)
+			configMapClient.EXPECT().Get(newCluster.Namespace, gomock.Any(), metav1.GetOptions{}).DoAndReturn(
+				func(namespace, name string, _ metav1.GetOptions) (*k8sv1.ConfigMap, error) {
+					key := "configmaps/" + name
+					reads = append(reads, key)
+					if name == "read-error" {
+						return nil, readError
+					}
+					annotations, found := tt.stored[key]
+					if !found {
+						return nil, apierrors.NewNotFound(k8sv1.Resource("configmaps"), name)
+					}
+					return &k8sv1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Annotations: annotations}}, nil
+				}).AnyTimes()
+			p := provisioningAdmitter{sourceAuthorizer: newTestSourceAuthorizer(t, client.AuthorizationV1()), mgmtClusterClient: mgmtClient,
+				secretCache: secretCache, secretClient: secretClient, configMapClient: configMapClient}
+			response, err := p.Admit(request)
+			// Read and SAR failures return errors; a completed SAR denying access returns a Forbidden response.
+			if tt.wantError != nil {
+				require.ErrorIs(t, err, tt.wantError)
+				require.NotNil(t, response)
+				assert.False(t, response.Allowed)
+				if tt.wantMessage != "" {
+					assert.Contains(t, err.Error(), tt.wantMessage)
+				}
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, response)
+				assert.Equal(t, !tt.wantDenied, response.Allowed)
+				if tt.wantDenied {
+					require.NotNil(t, response.Result)
+					assert.EqualValues(t, http.StatusForbidden, response.Result.Code)
+					assert.Equal(t, metav1.StatusReasonForbidden, response.Result.Reason)
+					assert.Equal(t, failureStatus, response.Result.Status)
+					assert.Contains(t, response.Result.Message, tt.wantMessage)
+					if tt.wantMessage != selectorMessage {
+						assert.NotContains(t, response.Result.Message, selectorMessage)
+					}
+				}
+			}
+			// Inspect the actual SAR calls to verify selection, deduplication and first-denial order.
+			var sources []string
+			for _, action := range client.Actions() {
+				require.Equal(t, "create", action.GetVerb())
+				require.Equal(t, "subjectaccessreviews", action.GetResource().Resource)
+				review := action.(k8stesting.CreateAction).GetObject().(*authv1.SubjectAccessReview)
+				attrs := review.Spec.ResourceAttributes
+				sources = append(sources, attrs.Resource+"/"+attrs.Name)
+				assert.Equal(t, newCluster.Namespace, attrs.Namespace)
+				if tt.checkIdentity {
+					// One allowed case verifies that the requesting user's full identity reaches the SAR.
+					assert.Equal(t, authv1.SubjectAccessReviewSpec{
+						ResourceAttributes: &authv1.ResourceAttributes{Verb: "get", Version: "v1", Resource: "secrets", Name: "allowed-secret", Namespace: "fleet-default"},
+						User:               "alice", UID: "alice-uid", Groups: []string{"developers"},
+						Extra: map[string]authv1.ExtraValue{"scope": {"clusters"}},
+					}, review.Spec)
+				}
+			}
+			assert.Equal(t, tt.wantSources, sources)
+			assert.Equal(t, tt.wantReads, reads)
+		})
+	}
+}
+
+func TestAdmitMachineSelectorFilesAccessCache(t *testing.T) {
+	sarError := errors.New("SAR unavailable")
+	allowed := authv1.SubjectAccessReviewStatus{Allowed: true}
+	denied := authv1.SubjectAccessReviewStatus{Denied: true}
+	noOpinion := authv1.SubjectAccessReviewStatus{} // Neither allowed nor denied.
+	tests := []struct {
+		name string
+		// statuses holds the SAR response for each call, in order.
+		statuses    []authv1.SubjectAccessReviewStatus
+		changeUser  func(*authenticationv1.UserInfo)
+		wantAllowed []bool
+		wantCalls   int
+		wantError   error
+	}{
+		{name: "allowed result reused", statuses: []authv1.SubjectAccessReviewStatus{allowed}, wantAllowed: []bool{true, true}, wantCalls: 1},
+		{name: "denied result reused", statuses: []authv1.SubjectAccessReviewStatus{denied}, wantAllowed: []bool{false, false}, wantCalls: 1},
+		{name: "no opinion rejects both requests", statuses: []authv1.SubjectAccessReviewStatus{noOpinion}, wantAllowed: []bool{false, false}, wantCalls: 1},
+		{name: "SAR error is not cached", wantError: sarError, wantCalls: 2},
+		{name: "transient error is not retried or cached", wantError: apierrors.NewInternalError(sarError), wantCalls: 2},
+		{
+			name:        "different user cannot reuse allowed result",
+			statuses:    []authv1.SubjectAccessReviewStatus{allowed, denied},
+			changeUser:  func(info *authenticationv1.UserInfo) { info.Username = "bob" },
+			wantAllowed: []bool{true, false}, wantCalls: 2,
+		},
+		{
+			name:        "different UID cannot reuse allowed result",
+			statuses:    []authv1.SubjectAccessReviewStatus{allowed, denied},
+			changeUser:  func(info *authenticationv1.UserInfo) { info.UID = "other-uid" },
+			wantAllowed: []bool{true, false}, wantCalls: 2,
+		},
+		{
+			name:        "different groups cannot reuse allowed result",
+			statuses:    []authv1.SubjectAccessReviewStatus{allowed, denied},
+			changeUser:  func(info *authenticationv1.UserInfo) { info.Groups = []string{"other-group"} },
+			wantAllowed: []bool{true, false}, wantCalls: 2,
+		},
+		{
+			name:     "different extras cannot reuse allowed result",
+			statuses: []authv1.SubjectAccessReviewStatus{allowed, denied},
+			changeUser: func(info *authenticationv1.UserInfo) {
+				info.Extra["scope"] = authenticationv1.ExtraValue{"other-scope"}
+			},
+			wantAllowed: []bool{true, false}, wantCalls: 2,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := k8sfake.NewSimpleClientset()
+			calls := 0
+			client.PrependReactor("create", "subjectaccessreviews", func(_ k8stesting.Action) (bool, runtime.Object, error) {
+				calls++
+				if tt.wantError != nil {
+					return true, nil, tt.wantError
+				}
+				if calls > len(tt.statuses) {
+					return true, nil, fmt.Errorf("unexpected SAR call %d", calls)
+				}
+				return true, &authv1.SubjectAccessReview{Status: tt.statuses[calls-1]}, nil
+			})
+			ctrl := gomock.NewController(t)
+			secretCache := fake.NewMockCacheInterface[*k8sv1.Secret](ctrl)
+			// No PSACT is selected; its validator must find no generated Secret.
+			secretCache.EXPECT().Get("fleet-default", "test-cluster-admission-configuration-psact").Return(nil,
+				apierrors.NewNotFound(k8sv1.Resource("secrets"), "test-cluster-admission-configuration-psact")).AnyTimes()
+			p := provisioningAdmitter{sourceAuthorizer: newTestSourceAuthorizer(t, client.AuthorizationV1()), secretCache: secretCache}
+			oldCluster := &v1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "fleet-default"},
+				Spec: v1.ClusterSpec{KubernetesVersion: "v1.34.1+rke2r1", RKEConfig: &v1.RKEConfig{
+					ClusterConfiguration: rkev1.ClusterConfiguration{MachineSelectorFiles: []rkev1.RKEProvisioningFiles{{
+						FileSources: []rkev1.ProvisioningFileSource{{Secret: rkev1.K8sObjectFileSource{
+							Name: "source", Items: []rkev1.KeyToPath{{Key: "config", Path: "/etc/config"}},
+						}}},
+					}}},
+				}},
+			}
+			// Both admissions change the file path, so both must perform authorization even with unchanged labels.
+			newCluster := oldCluster.DeepCopy()
+			newCluster.Spec.RKEConfig.MachineSelectorFiles[0].FileSources[0].Secret.Items[0].Path = "/other"
+			oldRaw, err := json.Marshal(oldCluster)
+			require.NoError(t, err)
+			raw, err := json.Marshal(newCluster)
+			require.NoError(t, err)
+			request := &admission.Request{
+				Context: context.Background(),
+				AdmissionRequest: admissionv1.AdmissionRequest{
+					Operation: admissionv1.Update, Namespace: newCluster.Namespace,
+					UserInfo: authenticationv1.UserInfo{Username: "alice", UID: "alice-uid", Groups: []string{"developers"},
+						Extra: map[string]authenticationv1.ExtraValue{"scope": {"clusters"}}},
+					Object: runtime.RawExtension{Raw: raw}, OldObject: runtime.RawExtension{Raw: oldRaw},
+				},
+			}
+			for i := range 2 {
+				if i == 1 && tt.changeUser != nil {
+					tt.changeUser(&request.UserInfo)
+				}
+				response, err := p.Admit(request)
+				if tt.wantError != nil {
+					require.ErrorIs(t, err, tt.wantError)
+					require.False(t, response.Allowed)
+					continue
+				}
+				require.NoError(t, err)
+				require.Equal(t, tt.wantAllowed[i], response.Allowed)
+				if !response.Allowed {
+					require.EqualValues(t, http.StatusForbidden, response.Result.Code)
+				}
+			}
+			assert.Equal(t, tt.wantCalls, calls)
+		})
+	}
+}
+
+func TestAdmitMachineSelectorFilesAccessPSACT(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	// Provide the real mutator with a template and simulate its Secret storage below.
+	template := &v3.PodSecurityAdmissionConfigurationTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "template"},
+		Configuration: v3.PodSecurityAdmissionConfigurationTemplateSpec{
+			Defaults: v3.PodSecurityAdmissionConfigurationTemplateDefaults{Enforce: "baseline", EnforceVersion: "latest"},
+		},
+	}
+	psactCache := fake.NewMockNonNamespacedCacheInterface[*v3.PodSecurityAdmissionConfigurationTemplate](ctrl)
+	psactCache.EXPECT().Get("template").Return(template, nil).AnyTimes()
+	// Share Secret state between mutator writes and validator reads across the workflow steps.
+	var storedSecret *k8sv1.Secret
+	secretCache := fake.NewMockCacheInterface[*k8sv1.Secret](ctrl)
+	secretCache.EXPECT().Get("fleet-default", "test-cluster-admission-configuration-psact").DoAndReturn(
+		func(_, name string) (*k8sv1.Secret, error) {
+			if storedSecret == nil {
+				return nil, apierrors.NewNotFound(k8sv1.Resource("secrets"), name)
+			}
+			// Return a copy so in-place edits cannot bypass the mocked client writes.
+			return storedSecret.DeepCopy(), nil
+		}).AnyTimes()
+	secretClient := fake.NewMockControllerInterface[*k8sv1.Secret, *k8sv1.SecretList](ctrl)
+	secretClient.EXPECT().Cache().Return(secretCache).AnyTimes()
+	secretClient.EXPECT().Create(gomock.Any()).DoAndReturn(func(secret *k8sv1.Secret) (*k8sv1.Secret, error) {
+		storedSecret = secret.DeepCopy()
+		return secret, nil
+	})
+	// Template content and Kubernetes version changes each update the generated Secret.
+	secretClient.EXPECT().Update(gomock.Any()).DoAndReturn(func(secret *k8sv1.Secret) (*k8sv1.Secret, error) {
+		storedSecret = secret.DeepCopy()
+		return secret, nil
+	}).Times(2)
+	var reads []string
+	// Only the ordinary source is read on the final label edit; any PSACT read fails this expectation.
+	secretClient.EXPECT().Get("fleet-default", "allowed-selector", metav1.GetOptions{}).DoAndReturn(
+		func(namespace, name string, _ metav1.GetOptions) (*k8sv1.Secret, error) {
+			reads = append(reads, "secrets/"+name)
+			return &k8sv1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace,
+				Annotations: map[string]string{authorizedObjectSelectorAnnotation: "env=dev"}}}, nil
+		})
+	mgmtClient := fake.NewMockNonNamespacedClientInterface[*v3.Cluster, *v3.ClusterList](ctrl)
+	// The first workflow step creates the cluster, so its management name must be available.
+	mgmtClient.EXPECT().Get("test-cluster", gomock.Any()).Return(nil, apierrors.NewNotFound(schema.GroupResource{Resource: "clusters"}, "test-cluster"))
+	client := k8sfake.NewSimpleClientset()
+	// Allow only the ordinary source; an accidentally checked PSACT entry would reject the request.
+	client.PrependReactor("create", "subjectaccessreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		review := action.(k8stesting.CreateAction).GetObject().(*authv1.SubjectAccessReview)
+		return true, &authv1.SubjectAccessReview{Status: authv1.SubjectAccessReviewStatus{
+			Allowed: review.Spec.ResourceAttributes.Name == "allowed-selector",
+		}}, nil
+	})
+	mutator := ProvisioningClusterMutator{secret: secretClient, psact: psactCache}
+	validator := provisioningAdmitter{sourceAuthorizer: newTestSourceAuthorizer(t, client.AuthorizationV1()),
+		mgmtClusterClient: mgmtClient, secretCache: secretCache, secretClient: secretClient, psactCache: psactCache}
+	cluster := &v1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "fleet-default"},
+		Spec: v1.ClusterSpec{KubernetesVersion: "v1.24.9+rke2r1", RKEConfig: &v1.RKEConfig{},
+			DefaultPodSecurityAdmissionConfigurationTemplateName: "template"},
+	}
+	var oldRaw []byte
+	var previousHash string
+	// Crossing Kubernetes 1.25 changes the generated PSA config from v1beta1 to v1, changing its hash.
+	steps := []struct {
+		name        string
+		change      func()
+		hashChanges bool
+		wantFiles   int
+		wantReads   []string
+		wantSources []string
+	}{
+		{name: "create", wantFiles: 1},
+		{name: "template content changes", change: func() { template.Configuration.Defaults.Enforce = "restricted" }, hashChanges: true, wantFiles: 1},
+		{name: "Kubernetes version changes", change: func() { cluster.Spec.KubernetesVersion = "v1.25.16+rke2r1" }, hashChanges: true, wantFiles: 1},
+		{name: "cluster labels change", change: func() { cluster.Labels = map[string]string{"env": "dev"} }, wantFiles: 1},
+		{
+			name: "add readable selector source without label change",
+			change: func() {
+				cluster.Spec.RKEConfig.MachineSelectorFiles = append(cluster.Spec.RKEConfig.MachineSelectorFiles, rkev1.RKEProvisioningFiles{
+					FileSources: []rkev1.ProvisioningFileSource{{Secret: rkev1.K8sObjectFileSource{
+						Name: "allowed-selector", Items: []rkev1.KeyToPath{{Key: "config", Path: "/etc/config"}},
+					}}},
+				})
+			},
+			wantFiles: 2, wantSources: []string{"secrets/allowed-selector"},
+		},
+		{
+			name:   "label change with unchanged PSACT and ordinary selector source",
+			change: func() { cluster.Labels["test"] = "test" },
+			// The annotation is read again, but the preceding step's allowed SAR is cached.
+			wantFiles: 2, wantReads: []string{"secrets/allowed-selector"},
+		},
+	}
+	for _, step := range steps {
+		t.Run(step.name, func(t *testing.T) {
+			// Check calls per step; the final label edit uses the entry saved by the preceding step.
+			client.ClearActions()
+			reads = nil
+			// Apply this step's change to the cluster or template left by the previous step.
+			if step.change != nil {
+				step.change()
+			}
+			raw, err := json.Marshal(cluster)
+			require.NoError(t, err)
+			operation := admissionv1.Update
+			// With no saved object yet, the first step is a create; later steps are updates.
+			if oldRaw == nil {
+				operation = admissionv1.Create
+			}
+			request := &admission.Request{
+				Context: context.Background(),
+				AdmissionRequest: admissionv1.AdmissionRequest{Operation: operation, Namespace: cluster.Namespace,
+					UserInfo: authenticationv1.UserInfo{Username: "alice"},
+					Object:   runtime.RawExtension{Raw: raw}, OldObject: runtime.RawExtension{Raw: oldRaw}},
+			}
+			response, err := mutator.Admit(request)
+			require.NoError(t, err)
+			require.True(t, response.Allowed)
+			// Validate the patched object, as Kubernetes does after mutating admission.
+			if len(response.Patch) > 0 {
+				patch, err := jsonpatch.DecodePatch(response.Patch)
+				require.NoError(t, err)
+				raw, err = patch.Apply(raw)
+				require.NoError(t, err)
+			}
+			request.Object.Raw = raw
+			// Both webhooks must accept the request without asking for read access to the generated Secret.
+			response, err = validator.Admit(request)
+			require.NoError(t, err)
+			require.True(t, response.Allowed, "user without Secret access must be able to use PSACT")
+			var sources []string
+			for _, action := range client.Actions() {
+				review := action.(k8stesting.CreateAction).GetObject().(*authv1.SubjectAccessReview)
+				attrs := review.Spec.ResourceAttributes
+				sources = append(sources, attrs.Resource+"/"+attrs.Name)
+			}
+			assert.Equal(t, step.wantSources, sources, "generated PSACT entry must not send a SAR")
+			assert.Equal(t, step.wantReads, reads, "generated PSACT entry must not be read for label validation")
+			// Decode into a fresh object so reordered entries cannot retain fields omitted from JSON.
+			cluster = &v1.Cluster{}
+			require.NoError(t, json.Unmarshal(raw, cluster))
+			require.Len(t, cluster.Spec.RKEConfig.MachineSelectorFiles, step.wantFiles)
+			// Find the generated entry by its source because the mutator may reorder the list.
+			psaIndex := slices.IndexFunc(cluster.Spec.RKEConfig.MachineSelectorFiles, func(file rkev1.RKEProvisioningFiles) bool {
+				return len(file.FileSources) == 1 && file.FileSources[0].Secret.Name == "test-cluster-admission-configuration-psact"
+			})
+			require.NotEqual(t, -1, psaIndex)
+			hash := cluster.Spec.RKEConfig.MachineSelectorFiles[psaIndex].FileSources[0].Secret.Items[0].Hash
+			require.NotEmpty(t, hash)
+			// Confirm that content/version updates regenerated the entry, exercising the hash exemption.
+			if step.hashChanges {
+				assert.NotEqual(t, previousHash, hash)
+			}
+			previousHash = hash
+			// The next update starts from the complete object saved by this step.
+			oldRaw = raw
+		})
+	}
+}
+
+func TestIsPSACTMachineSelectorFile(t *testing.T) {
+	tests := []struct {
+		name      string
+		runtime   string
+		configure func(cluster *v1.Cluster, file *rkev1.RKEProvisioningFiles)
+		want      bool
+	}{
+		{name: "generated RKE2 entry with hash", runtime: "rke2", want: true},
+		{name: "generated K3s entry with hash", runtime: "k3s", want: true},
+		{name: "no template", configure: func(cluster *v1.Cluster, _ *rkev1.RKEProvisioningFiles) {
+			cluster.Spec.DefaultPodSecurityAdmissionConfigurationTemplateName = ""
+		}},
+		{name: "different cluster", configure: func(cluster *v1.Cluster, _ *rkev1.RKEProvisioningFiles) { cluster.Name = "other" }},
+		{name: "different path", configure: func(_ *v1.Cluster, file *rkev1.RKEProvisioningFiles) {
+			file.FileSources[0].Secret.Items[0].Path = "/other"
+		}},
+		{name: "additional source", configure: func(_ *v1.Cluster, file *rkev1.RKEProvisioningFiles) {
+			file.FileSources = append(file.FileSources, rkev1.ProvisioningFileSource{Secret: rkev1.K8sObjectFileSource{Name: "other"}})
+		}},
+		{name: "configmap with PSACT name", configure: func(_ *v1.Cluster, file *rkev1.RKEProvisioningFiles) {
+			file.FileSources[0].ConfigMap = file.FileSources[0].Secret
+			file.FileSources[0].Secret = rkev1.K8sObjectFileSource{}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			distro := tt.runtime
+			if distro == "" {
+				distro = "rke2"
+			}
+			cluster := &v1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-cluster"},
+				Spec: v1.ClusterSpec{
+					KubernetesVersion: "v1.34.1+" + distro + "r1",
+					DefaultPodSecurityAdmissionConfigurationTemplateName: "template",
+				},
+			}
+			file := machineSelectorFileForPSA("test-cluster-admission-configuration-psact",
+				"/etc/rancher/"+distro+"/config/rancher-psact.yaml", "generated-hash")
+			if tt.configure != nil {
+				tt.configure(cluster, file)
+			}
+			before := file.DeepCopy()
+			assert.Equal(t, tt.want, isPSACTMachineSelectorFile(cluster, file))
+			assert.Equal(t, before, file, "hash cleanup must not mutate the entry")
+		})
+	}
+}
+
+func Test_isValidName(t *testing.T) {
+	tests := []struct {
+		name, clusterName, clusterNamespace string
+		clusterExists                       bool
+		want                                bool
+	}{
+		{
+			name:             "local cluster in fleet-local",
+			clusterName:      "local",
+			clusterNamespace: "fleet-local",
+			clusterExists:    true,
+			want:             true,
+		},
+		{
+			name:             "local cluster in fleet-local, cluster does not exist",
+			clusterName:      "local",
+			clusterNamespace: "fleet-local",
+			clusterExists:    false,
+			want:             true,
+		},
+		{
+			name:             "local cluster not in fleet-local",
+			clusterName:      "local",
+			clusterNamespace: "fleet-default",
+			clusterExists:    true,
+			want:             false,
+		},
+		{
+			name:             "c-xxxxx cluster exists",
+			clusterName:      "c-12345",
+			clusterNamespace: "default",
+			clusterExists:    true,
+			want:             true,
+		},
+		{
+			name:             "c-xxxxx cluster does not exist",
+			clusterName:      "c-xxxxx",
+			clusterNamespace: "fleet-default",
+			clusterExists:    false,
+			want:             false,
+		},
+		{
+			name:             "suffix matches c-xxxxx and cluster exists",
+			clusterName:      "logic-xxxxx",
+			clusterNamespace: "fleet-local",
+			clusterExists:    true,
+			want:             true,
+		},
+		{
+			name:             "prefix matches c-xxxxx and cluster exists",
+			clusterName:      "c-aaaaab",
+			clusterNamespace: "fleet-default",
+			clusterExists:    true,
+			want:             true,
+		},
+		{
+			name:             "substring matches c-xxxxx and cluster exists",
+			clusterName:      "logic-1a3c5bool",
+			clusterNamespace: "cattle-system",
+			clusterExists:    true,
+			want:             true,
+		},
+		{
+			name:             "substring matches c-xxxxx and cluster does not exist",
+			clusterName:      "logic-1a3c5bool",
+			clusterNamespace: "cattle-system",
+			clusterExists:    false,
+			want:             true,
+		},
+		{
+			name:             "name length is exactly 63 characters",
+			clusterName:      "cq8oh6uvntypoitcfwrxfjjruz4kv2q6itimqkcgex1zqgm7oa3jbld9n0diika",
+			clusterNamespace: "fleet-default",
+			clusterExists:    false,
+			want:             true,
+		},
+		{
+			name:             "name length is 64 characters",
+			clusterName:      "xd0pegoo51iswfkx173upiknot0dsgp0jkuausssk2vwunjrwalb2raypjntvtpa",
+			clusterNamespace: "fleet-default",
+			clusterExists:    false,
+			want:             false,
+		},
+		{
+			name:             "name length is 253 characters",
+			clusterName:      "dxht2wgxbask8lpj4nfqmycykcsmzv6bwtl7xeo3nuxnw6tk07vofjjjmepy6avdhd03or2hnw8uqjtdh2lvbprh4v0rjochgealmptz4sqt3pt5stcce4eirk37ytjfquhodxknqqzpidll6txreiq9ppaaswuwpq8opadhqitfln2txsgowc80wwgkgikczh6f8fuihvvizf65tn2wbeysudyeofgltadug1cjwohm7n9yovrd0fiyxm0bk",
+			clusterNamespace: "fleet-default",
+			clusterExists:    false,
+			want:             false,
+		},
+		{
+			name:             "name containing . does not conform to RFC-1123",
+			clusterName:      "cluster.test.name",
+			clusterNamespace: "fleet-default",
+			clusterExists:    false,
+			want:             false,
+		},
+		{
+			name:             "name containing uppercase characters does not conform to RFC-1123",
+			clusterName:      "CLUSTER-NAME",
+			clusterNamespace: "fleet-default",
+			clusterExists:    true,
+			want:             false,
+		},
+		{
+			name:             "name cannot begin with hyphen",
+			clusterName:      "-CLUSTER-NAME",
+			clusterNamespace: "fleet-default",
+			clusterExists:    true,
+			want:             false,
+		},
+		{
+			name:             "name cannot only be hyphens",
+			clusterName:      "---------------------------",
+			clusterNamespace: "fleet-default",
+			clusterExists:    false,
+			want:             false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isValidName(tt.clusterName, tt.clusterNamespace, tt.clusterExists); got != tt.want {
+				t.Errorf("isValidName() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidNoProxy(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		oldCluster *v1.Cluster
+		newCluster *v1.Cluster
+		request    *admission.Request
+		expected   bool
+	}{
+		{
+			name: "valid cluster create operation",
+			request: &admission.Request{
+				AdmissionRequest: admissionv1.AdmissionRequest{
+					Operation: admissionv1.Create,
+				},
+			},
+			newCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "NO_PROXY",
+							Value: "valid,value",
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "valid cluster create operation lowercase",
+			request: &admission.Request{
+				AdmissionRequest: admissionv1.AdmissionRequest{
+					Operation: admissionv1.Create,
+				},
+			},
+			newCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "no_proxy",
+							Value: "valid,value",
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "invalid cluster create operation",
+			request: &admission.Request{
+				AdmissionRequest: admissionv1.AdmissionRequest{
+					Operation: admissionv1.Create,
+				},
+			},
+			newCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "NO_PROXY",
+							Value: "something bad",
+						},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "invalid cluster create operation lowercase",
+			request: &admission.Request{
+				AdmissionRequest: admissionv1.AdmissionRequest{
+					Operation: admissionv1.Create,
+				},
+			},
+			newCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "no_proxy",
+							Value: "something bad",
+						},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "valid cluster update operation",
+			request: &admission.Request{
+				AdmissionRequest: admissionv1.AdmissionRequest{
+					Operation: admissionv1.Update,
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					AgentEnvVars: []rkev1.EnvVar{},
+				},
+			},
+			newCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "NO_PROXY",
+							Value: "valid,value",
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "valid cluster update operation lowercase",
+			request: &admission.Request{
+				AdmissionRequest: admissionv1.AdmissionRequest{
+					Operation: admissionv1.Update,
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					AgentEnvVars: []rkev1.EnvVar{},
+				},
+			},
+			newCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "no_proxy",
+							Value: "valid,value",
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "valid cluster update operation",
+			request: &admission.Request{
+				AdmissionRequest: admissionv1.AdmissionRequest{
+					Operation: admissionv1.Update,
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "NO_PROXY",
+							Value: "previous,value",
+						},
+					},
+				},
+			},
+			newCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "NO_PROXY",
+							Value: "valid,value",
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "valid malformed cluster update operation",
+			request: &admission.Request{
+				AdmissionRequest: admissionv1.AdmissionRequest{
+					Operation: admissionv1.Update,
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "NO_PROXY",
+							Value: "previous, bad , value",
+						},
+					},
+				},
+			},
+			newCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "NO_PROXY",
+							Value: "new, bad, value",
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "invalid cluster update operation",
+			request: &admission.Request{
+				AdmissionRequest: admissionv1.AdmissionRequest{
+					Operation: admissionv1.Update,
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					AgentEnvVars: []rkev1.EnvVar{},
+				},
+			},
+			newCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "NO_PROXY",
+							Value: "new, bad, value",
+						},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "invalid cluster update operation lowercase",
+			request: &admission.Request{
+				AdmissionRequest: admissionv1.AdmissionRequest{
+					Operation: admissionv1.Update,
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					AgentEnvVars: []rkev1.EnvVar{},
+				},
+			},
+			newCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "no_proxy",
+							Value: "new, bad, value",
+						},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "invalid cluster update operation",
+			request: &admission.Request{
+				AdmissionRequest: admissionv1.AdmissionRequest{
+					Operation: admissionv1.Update,
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "NO_PROXY",
+							Value: "a,previous,value",
+						},
+					},
+				},
+			},
+			newCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "NO_PROXY",
+							Value: "new, bad, value",
+						},
+					},
+				},
+			},
+			expected: false,
+		},
+	}
+
+	for _, tst := range tests {
+		tst := tst
+		t.Run(tst.name, func(t *testing.T) {
+			resp := validateHTTPNoProxyVariable(tst.request, tst.oldCluster, tst.newCluster)
+
+			var oldValue, newValue string
+			if tst.newCluster != nil && len(tst.newCluster.Spec.AgentEnvVars) > 0 {
+				newValue = tst.newCluster.Spec.AgentEnvVars[0].Value
+			}
+			if tst.oldCluster != nil && len(tst.oldCluster.Spec.AgentEnvVars) > 0 {
+				oldValue = tst.oldCluster.Spec.AgentEnvVars[0].Value
+			}
+
+			if (resp.Result == nil || resp.Result.Status != failureStatus) && !tst.expected {
+				if oldValue == "" && newValue != "" {
+					t.Logf("Expected error when providing NO_PROXY value of '%s'", newValue)
+				}
+				if oldValue != "" && newValue != "" {
+					t.Logf("Expected error when updating from old value of '%s' to new value of '%s'", oldValue, newValue)
+				}
+				t.Fail()
+			}
+
+			if (resp.Result != nil && resp.Result.Status == failureStatus) && tst.expected {
+				if oldValue == "" && newValue != "" {
+					t.Logf("Encountered unexpected error when providing NO_PROXY value of '%s'", newValue)
+				}
+				if oldValue != "" && newValue != "" {
+					t.Logf("Encountered unexpected error when updating from old value of '%s' to new value of '%s'", oldValue, newValue)
+				}
+				t.Fail()
+			}
+		})
+	}
+}
+
+func TestValidateMachinePoolName(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name, value string
+		fail        bool
+	}{
+		{
+			name:  "muchTooLong",
+			value: strings.Repeat("12345678", 8),
+			fail:  true,
+		},
+		{
+			name:  "barelyUnderLimit",
+			value: strings.Repeat("12345678", 7),
+			fail:  false,
+		},
+		{
+			name:  "regularLookingString",
+			value: "regular-string-test",
+			fail:  false,
+		},
+	}
+
+	a := provisioningAdmitter{}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			resp := admissionv1.AdmissionResponse{}
+
+			err := a.validateMachinePoolNames(
+				&admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Create}},
+				&resp,
+				&v1.Cluster{
+					Spec: v1.ClusterSpec{
+						RKEConfig: &v1.RKEConfig{
+							MachinePools: []v1.RKEMachinePool{{Name: tt.value}},
+						},
+					},
+				},
+			)
+			if err != nil {
+				t.Errorf("got error when none was expected: %v", err)
+			}
+
+			if tt.fail {
+				if resp.Result == nil {
+					t.Error("got no result on response when one was expected")
+				}
+				if resp.Result.Status != "Failure" {
+					t.Errorf("got %v when Failure was expected", resp.Result.Status)
+				}
+			} else {
+				if resp.Result != nil {
+					t.Error("got result on response when none was expected")
+				}
+			}
+		})
+	}
+}
+
+func TestValidateSystemAgentDataDirectory(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		cluster       *v1.Cluster
+		oldCluster    *v1.Cluster
+		shouldSucceed bool
+	}{
+		{
+			name: "base",
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+				},
+			},
+			shouldSucceed: true,
+		},
+		{
+			name: "same env var",
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "CATTLE_AGENT_VAR_DIR",
+							Value: "a",
+						},
+					},
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "CATTLE_AGENT_VAR_DIR",
+							Value: "a",
+						},
+					},
+				},
+			},
+			shouldSucceed: true,
+		},
+		{
+			name: "change env var",
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "CATTLE_AGENT_VAR_DIR",
+							Value: "a",
+						},
+					},
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "CATTLE_AGENT_VAR_DIR",
+							Value: "b",
+						},
+					},
+				},
+			},
+			shouldSucceed: false,
+		},
+		{
+			name: "same data directory",
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								SystemAgent: "a",
+							},
+						},
+					},
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								SystemAgent: "a",
+							},
+						},
+					},
+				},
+			},
+			shouldSucceed: true,
+		},
+		{
+			name: "change data directory",
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								SystemAgent: "a",
+							},
+						},
+					},
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								SystemAgent: "b",
+							},
+						},
+					},
+				},
+			},
+			shouldSucceed: false,
+		},
+		{
+			name: "add unrelated env var",
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "CATTLE_TEST_VAR",
+							Value: "a",
+						},
+					},
+				},
+			},
+			shouldSucceed: true,
+		},
+		{
+			name: "migrate env var",
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								SystemAgent: "a",
+							},
+						},
+					},
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "CATTLE_AGENT_VAR_DIR",
+							Value: "a",
+						},
+					},
+				},
+			},
+			shouldSucceed: true,
+		},
+		{
+			name: "change during migration",
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								SystemAgent: "b",
+							},
+						},
+					},
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "CATTLE_AGENT_VAR_DIR",
+							Value: "a",
+						},
+					},
+				},
+			},
+			shouldSucceed: false,
+		},
+		{
+			name: "reverse migrate env var",
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "CATTLE_AGENT_VAR_DIR",
+							Value: "a",
+						},
+					},
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								SystemAgent: "a",
+							},
+						},
+					},
+				},
+			},
+			shouldSucceed: false,
+		},
+		{
+			name: "removing env var",
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig:    &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{},
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "CATTLE_AGENT_VAR_DIR",
+							Value: "a",
+						},
+					},
+				},
+			},
+			shouldSucceed: false,
+		},
+		{
+			name: "removing data directory",
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig:    &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{},
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								SystemAgent: "a",
+							},
+						},
+					},
+				},
+			},
+			shouldSucceed: false,
+		},
+		{
+			name: "adding env var",
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "CATTLE_AGENT_VAR_DIR",
+							Value: "a",
+						},
+					},
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig:    &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{},
+				},
+			},
+			shouldSucceed: false,
+		},
+		{
+			name: "adding data directory",
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								SystemAgent: "a",
+							},
+						},
+					},
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig:    &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{},
+				},
+			},
+			shouldSucceed: false,
+		},
+		{
+			name: "add env var with data directory",
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								SystemAgent: "a",
+							},
+						},
+					},
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "CATTLE_AGENT_VAR_DIR",
+							Value: "b",
+						},
+					},
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								SystemAgent: "a",
+							},
+						},
+					},
+				},
+			},
+			shouldSucceed: false,
+		},
+		{
+			name: "set data directory without migrating",
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								SystemAgent: "a",
+							},
+						},
+					},
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "CATTLE_AGENT_VAR_DIR",
+							Value: "a",
+						},
+					},
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "CATTLE_AGENT_VAR_DIR",
+							Value: "a",
+						},
+					},
+				},
+			},
+			shouldSucceed: false,
+		},
+		{
+			name: "update unrelated vars",
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "CATTLE_TEST_VAR",
+							Value: "a",
+						},
+					},
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "CATTLE_TEST_VAR",
+							Value: "b",
+						},
+					},
+				},
+			},
+			shouldSucceed: true,
+		},
+	}
+
+	a := provisioningAdmitter{}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			response := a.validateSystemAgentDataDirectory(tt.oldCluster, tt.cluster)
+			assert.Equal(t, tt.shouldSucceed, response.Allowed)
+		})
+	}
+}
+
+func TestValidateDataDirectories(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		request       *admission.Request
+		cluster       *v1.Cluster
+		oldCluster    *v1.Cluster
+		shouldSucceed bool
+	}{
+		{
+			name:          "no rkeconfig",
+			request:       &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Update}},
+			cluster:       &v1.Cluster{},
+			oldCluster:    nil,
+			shouldSucceed: true,
+		},
+		{
+			name:    "old no rkeconfig",
+			request: &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Update}},
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+				},
+			},
+			oldCluster:    &v1.Cluster{},
+			shouldSucceed: true,
+		},
+		{
+			name:    "Create",
+			request: &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Create}},
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+				},
+			},
+			oldCluster:    nil,
+			shouldSucceed: true,
+		},
+		{
+			name:    "Create with CATTLE_AGENT_VAR_DIR",
+			request: &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Create}},
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "CATTLE_AGENT_VAR_DIR",
+							Value: "/a",
+						},
+					},
+				},
+			},
+			oldCluster:    nil,
+			shouldSucceed: false,
+		},
+		{
+			name:    "CREATE with valid distinct data directories",
+			request: &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Create}},
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								K8sDistro:    "/var/lib/rancher/rke2",
+								Provisioning: "/var/lib/rancher/provisioning",
+								SystemAgent:  "/opt/rancher/system-agent",
+							},
+						},
+					},
+				},
+			},
+			shouldSucceed: true,
+		},
+		{
+			name:    "CREATE distro data dir is relative",
+			request: &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Create}},
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								K8sDistro: "a",
+							},
+						},
+					},
+				},
+			},
+			shouldSucceed: false,
+		},
+		{
+			name:    "CREATE provisioning data dir is relative",
+			request: &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Create}},
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								Provisioning: "a",
+							},
+						},
+					},
+				},
+			},
+			shouldSucceed: false,
+		},
+		{
+			name:    "CREATE system agent data dir is relative",
+			request: &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Create}},
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								SystemAgent: "a",
+							},
+						},
+					},
+				},
+			},
+			shouldSucceed: false,
+		},
+		{
+			name:    "CREATE distro data dir == provisioning data dir",
+			request: &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Create}},
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								K8sDistro:    "/a",
+								Provisioning: "/a",
+							},
+						},
+					},
+				},
+			},
+			shouldSucceed: false,
+		},
+		{
+			name:    "CREATE distro data dir == system agent data dir",
+			request: &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Create}},
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								K8sDistro:   "/a",
+								SystemAgent: "/a",
+							},
+						},
+					},
+				},
+			},
+			shouldSucceed: false,
+		},
+		{
+			name:    "CREATE provisioning data dir == system agent data dir",
+			request: &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Create}},
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								Provisioning: "/a",
+								SystemAgent:  "/a",
+							},
+						},
+					},
+				},
+			},
+			shouldSucceed: false,
+		},
+		{
+			name:    "CREATE distro data dir contains provisioning data dir",
+			request: &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Create}},
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								K8sDistro:    "/a",
+								Provisioning: "/a/b",
+							},
+						},
+					},
+				},
+			},
+			shouldSucceed: false,
+		},
+		{
+			name:    "CREATE provisioning data dir contains distro data dir",
+			request: &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Create}},
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								K8sDistro:    "/a/b",
+								Provisioning: "/a",
+							},
+						},
+					},
+				},
+			},
+			shouldSucceed: false,
+		},
+		{
+			name:    "CREATE provisioning data dir contains distro data dir multiple levels deep",
+			request: &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Create}},
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								K8sDistro:    "/a/b/c/d",
+								Provisioning: "/a",
+							},
+						},
+					},
+				},
+			},
+			shouldSucceed: false,
+		},
+		{
+			name:    "CREATE system agent data dir contains provisioning data dir",
+			request: &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Create}},
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								Provisioning: "/a",
+								SystemAgent:  "/a/b",
+							},
+						},
+					},
+				},
+			},
+			shouldSucceed: false,
+		},
+		{
+			name:    "Delete",
+			request: &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Delete}},
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "CATTLE_AGENT_VAR_DIR",
+							Value: "/a",
+						},
+					},
+				},
+			},
+			oldCluster:    nil,
+			shouldSucceed: true,
+		},
+		{
+			name:          "Update unmanaged cluster",
+			request:       &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Update}},
+			cluster:       &v1.Cluster{},
+			oldCluster:    &v1.Cluster{},
+			shouldSucceed: true,
+		},
+		{
+			name:    "CATTLE_AGENT_VAR_DIR not present in old or new",
+			request: &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Update}},
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig:    &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{},
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig:    &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{},
+				},
+			},
+			shouldSucceed: true,
+		},
+		{
+			name:    "CATTLE_AGENT_VAR_DIR present in old and new",
+			request: &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Update}},
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "CATTLE_AGENT_VAR_DIR",
+							Value: "/a",
+						},
+					},
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "CATTLE_AGENT_VAR_DIR",
+							Value: "/a",
+						},
+					},
+				},
+			},
+			shouldSucceed: true,
+		},
+		{
+			name:    "CATTLE_AGENT_VAR_DIR present in old and new but different value",
+			request: &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Update}},
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "CATTLE_AGENT_VAR_DIR",
+							Value: "/a",
+						},
+					},
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "CATTLE_AGENT_VAR_DIR",
+							Value: "/b",
+						},
+					},
+				},
+			},
+			shouldSucceed: false,
+		},
+		{
+			name:    "CATTLE_AGENT_VAR_DIR present in old and migrated to new",
+			request: &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Update}},
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								SystemAgent: "/a",
+							},
+						},
+					},
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+					AgentEnvVars: []rkev1.EnvVar{
+						{
+							Name:  "CATTLE_AGENT_VAR_DIR",
+							Value: "/a",
+						},
+					},
+				},
+			},
+			shouldSucceed: true,
+		},
+		{
+			name:    "system-agent data dir changed",
+			request: &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Update}},
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								SystemAgent: "/a",
+							},
+						},
+					},
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								SystemAgent: "/b",
+							},
+						},
+					},
+				},
+			},
+			shouldSucceed: false,
+		},
+		{
+			name:    "provisioning data dir changed",
+			request: &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Update}},
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								Provisioning: "/a",
+							},
+						},
+					},
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								Provisioning: "/b",
+							},
+						},
+					},
+				},
+			},
+			shouldSucceed: false,
+		},
+		{
+			name:    "UPDATE with unchanged valid data directories",
+			request: &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Update}},
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								K8sDistro:    "/var/lib/rancher/rke2",
+								Provisioning: "/var/lib/rancher/provisioning",
+								SystemAgent:  "/opt/rancher/system-agent",
+							},
+						},
+					},
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								K8sDistro:    "/var/lib/rancher/rke2",
+								Provisioning: "/var/lib/rancher/provisioning",
+								SystemAgent:  "/opt/rancher/system-agent",
+							},
+						},
+					},
+				},
+			},
+			shouldSucceed: true,
+		},
+		{
+			name:    "distro data dir changed",
+			request: &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Update}},
+			cluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								K8sDistro: "/a",
+							},
+						},
+					},
+				},
+			},
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							DataDirectories: rkev1.DataDirectories{
+								K8sDistro: "/b",
+							},
+						},
+					},
+				},
+			},
+			shouldSucceed: false,
+		},
+	}
+
+	a := provisioningAdmitter{}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			response := a.validateDataDirectories(tt.request, tt.oldCluster, tt.cluster)
+			assert.Equal(t, tt.shouldSucceed, response.Allowed)
+		})
+	}
+}
+
+func validateFailedPaths(s []string) func(t *testing.T, err field.ErrorList) {
+	return func(t *testing.T, err field.ErrorList) {
+		t.Helper()
+		errPaths := make([]string, len(err))
+		for i := 0; i < len(err); i++ {
+			errPaths[i] = err[i].Field
+		}
+
+		if !assert.ElementsMatch(t, s, errPaths) {
+			b := strings.Builder{}
+			b.WriteString("Failed Fields and reasons: ")
+			for _, v := range err {
+				b.WriteString("\n* ")
+				b.WriteString(v.Error())
+			}
+			fmt.Println(b.String())
+		}
+	}
+}
+
+func Test_validateAgentDeploymentCustomization(t *testing.T) {
+	type args struct {
+		customization *v1.AgentDeploymentCustomization
+		path          *field.Path
+	}
+
+	tests := []struct {
+		name         string
+		args         args
+		validateFunc func(t *testing.T, err field.ErrorList)
+	}{
+		{
+			name: "empty",
+			args: args{
+				customization: nil,
+				path:          field.NewPath("test"),
+			},
+			validateFunc: validateFailedPaths([]string{}),
+		},
+		{
+			name: "Ok",
+			args: args{
+				customization: &v1.AgentDeploymentCustomization{
+					AppendTolerations: []k8sv1.Toleration{
+						{
+							Key:   "validkey",
+							Value: "validValue",
+						},
+						{
+							Key:   "validkey.dot/dash",
+							Value: "true",
+						},
+					},
+					OverrideAffinity: &k8sv1.Affinity{
+						NodeAffinity: &k8sv1.NodeAffinity{
+							RequiredDuringSchedulingIgnoredDuringExecution: &k8sv1.NodeSelector{
+								NodeSelectorTerms: []k8sv1.NodeSelectorTerm{
+									{
+										MatchExpressions: []k8sv1.NodeSelectorRequirement{
+											{
+												Key:      "validkey.dot",
+												Operator: "equal",
+											},
+											{
+												Key:      "validkey.dot/dash",
+												Operator: "In",
+											},
+										},
+										MatchFields: []k8sv1.NodeSelectorRequirement{
+											{
+												Key: "validkey.dot",
+											},
+											{
+												Key: "validkey.dot/dash",
+											},
+										},
+									},
+								},
+							},
+							PreferredDuringSchedulingIgnoredDuringExecution: []k8sv1.PreferredSchedulingTerm{
+								{
+									Weight: 1,
+									Preference: k8sv1.NodeSelectorTerm{
+										MatchExpressions: []k8sv1.NodeSelectorRequirement{
+											{
+												Key:      "validkey.dot",
+												Operator: "in",
+											},
+											{
+												Key:      "validkey.dot/dash",
+												Operator: "in",
+											},
+										},
+										MatchFields: []k8sv1.NodeSelectorRequirement{
+											{
+												Key:      "validkey.dot",
+												Operator: "in",
+											},
+											{
+												Key:      "validkey.dot/dash",
+												Operator: "in",
+											},
+										},
+									},
+								},
+							},
+						},
+						PodAffinity: &k8sv1.PodAffinity{
+							RequiredDuringSchedulingIgnoredDuringExecution: []k8sv1.PodAffinityTerm{
+								{
+									LabelSelector: &metav1.LabelSelector{
+										MatchLabels: map[string]string{
+											"key": "validValue",
+										},
+										MatchExpressions: []metav1.LabelSelectorRequirement{
+											{
+												Key:      "validKey",
+												Operator: "In",
+												Values:   []string{""},
+											},
+										},
+									},
+								},
+							},
+							PreferredDuringSchedulingIgnoredDuringExecution: []k8sv1.WeightedPodAffinityTerm{
+								{
+									Weight: 1,
+									PodAffinityTerm: k8sv1.PodAffinityTerm{
+										NamespaceSelector: &metav1.LabelSelector{
+											MatchLabels: nil,
+											MatchExpressions: []metav1.LabelSelectorRequirement{
+												{
+													Key:      "validKey",
+													Operator: "In",
+													Values:   []string{""},
+												},
+												{
+													Key:      "validKey2",
+													Operator: "In",
+													Values:   []string{""},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+						PodAntiAffinity: &k8sv1.PodAntiAffinity{
+							RequiredDuringSchedulingIgnoredDuringExecution: []k8sv1.PodAffinityTerm{
+								{
+									LabelSelector: &metav1.LabelSelector{
+										MatchLabels: map[string]string{
+											"key": "validValue",
+										},
+										MatchExpressions: []metav1.LabelSelectorRequirement{
+											{
+												Key:      "validKey",
+												Operator: "In",
+												Values:   []string{""},
+											},
+										},
+									},
+								},
+							},
+							PreferredDuringSchedulingIgnoredDuringExecution: []k8sv1.WeightedPodAffinityTerm{
+								{
+									Weight: 1,
+									PodAffinityTerm: k8sv1.PodAffinityTerm{
+										NamespaceSelector: &metav1.LabelSelector{
+											MatchLabels: nil,
+											MatchExpressions: []metav1.LabelSelectorRequirement{
+												{
+													Key:      "validKey",
+													Operator: "In",
+													Values:   []string{""},
+												},
+												{
+													Key:      "validKey2",
+													Operator: "In",
+													Values:   []string{""},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				path: field.NewPath("test"),
+			},
+			validateFunc: validateFailedPaths([]string{}),
+		},
+		{
+			name: "invalid-args",
+			args: args{
+				customization: &v1.AgentDeploymentCustomization{
+					AppendTolerations: []k8sv1.Toleration{
+						{
+							Key: "`{}invalidKey",
+						},
+						{
+							Key: "`{}invalidKey.dot/dash",
+						},
+						{
+							Key:      "ValidKey",
+							Operator: "Equal",
+							Value:    "InvalidValue[]!-=123",
+						},
+						{
+							Key:      "ValidKey",
+							Operator: "InvalidOperator",
+							Value:    "ValidValue",
+						},
+						{
+							Key:      "ValidKey",
+							Operator: "Equal",
+							Value:    " ", // empty space also not allowed
+						},
+						{
+							Key:      "ValidKey",
+							Operator: "Exists",
+							Value:    "Contains should not have a value",
+						},
+					},
+					OverrideAffinity: &k8sv1.Affinity{
+						NodeAffinity: &k8sv1.NodeAffinity{
+							RequiredDuringSchedulingIgnoredDuringExecution: &k8sv1.NodeSelector{
+								NodeSelectorTerms: []k8sv1.NodeSelectorTerm{
+									{
+										MatchExpressions: []k8sv1.NodeSelectorRequirement{
+											{
+												Key:      "`{}invalidKey.dot",
+												Operator: "equal",
+											},
+											{
+												Key:      "`{}invalidKey.dot/dash",
+												Operator: "In",
+											},
+										},
+										MatchFields: []k8sv1.NodeSelectorRequirement{
+											{
+												Key: "`{}invalidKey.dot",
+											},
+											{
+												Key: "`{}invalidKey.dot/dash",
+											},
+										},
+									},
+								},
+							},
+							PreferredDuringSchedulingIgnoredDuringExecution: []k8sv1.PreferredSchedulingTerm{
+								{
+									Weight: 1,
+									Preference: k8sv1.NodeSelectorTerm{
+										MatchExpressions: []k8sv1.NodeSelectorRequirement{
+											{
+												Key:      "`{}invalidKey.dot",
+												Operator: "in",
+											},
+											{
+												Key:      "`{}invalidKey.dot/dash",
+												Operator: "in",
+											},
+										},
+										MatchFields: []k8sv1.NodeSelectorRequirement{
+											{
+												Key:      "`{}invalidKey.dot",
+												Operator: "in",
+											},
+											{
+												Key:      "`{}invalidKey.dot/dash",
+												Operator: "in",
+											},
+										},
+									},
+								},
+							},
+						},
+						PodAffinity: &k8sv1.PodAffinity{
+							RequiredDuringSchedulingIgnoredDuringExecution: []k8sv1.PodAffinityTerm{
+								{
+									LabelSelector: &metav1.LabelSelector{
+										MatchLabels: map[string]string{
+											"key": "`{}invalidKey",
+										},
+										MatchExpressions: []metav1.LabelSelectorRequirement{
+											{
+												Key:      "`{}invalidKey",
+												Operator: "In",
+												Values:   []string{""},
+											},
+										},
+									},
+								},
+							},
+							PreferredDuringSchedulingIgnoredDuringExecution: []k8sv1.WeightedPodAffinityTerm{
+								{
+									Weight: 1,
+									PodAffinityTerm: k8sv1.PodAffinityTerm{
+										NamespaceSelector: &metav1.LabelSelector{
+											MatchLabels: nil,
+											MatchExpressions: []metav1.LabelSelectorRequirement{
+												{
+													Key:      "`{}invalidKey",
+													Operator: "In",
+													Values:   []string{""},
+												},
+												{
+													Key:      "`{}invalidKey2",
+													Operator: "In",
+													Values:   []string{""},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+						PodAntiAffinity: &k8sv1.PodAntiAffinity{
+							RequiredDuringSchedulingIgnoredDuringExecution: []k8sv1.PodAffinityTerm{
+								{
+									LabelSelector: &metav1.LabelSelector{
+										MatchLabels: map[string]string{
+											"key": "validValue",
+										},
+										MatchExpressions: []metav1.LabelSelectorRequirement{
+											{
+												Key:      "`{}invalidKey",
+												Operator: "In",
+												Values:   []string{""},
+											},
+										},
+									},
+								},
+							},
+							PreferredDuringSchedulingIgnoredDuringExecution: []k8sv1.WeightedPodAffinityTerm{
+								{
+									Weight: 1,
+									PodAffinityTerm: k8sv1.PodAffinityTerm{
+										NamespaceSelector: &metav1.LabelSelector{
+											MatchLabels: nil,
+											MatchExpressions: []metav1.LabelSelectorRequirement{
+												{
+													Key:      "`{}invalidKey",
+													Operator: "In",
+													Values:   []string{""},
+												},
+												{
+													Key:      "`{}invalidKey2",
+													Operator: "In",
+													Values:   []string{""},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				path: field.NewPath("test"),
+			},
+			validateFunc: validateFailedPaths([]string{
+				"test.appendTolerations[0].key",
+				"test.appendTolerations[1].key",
+				"test.appendTolerations[2].value",
+				"test.appendTolerations[3].operator",
+				"test.appendTolerations[4].value",
+				"test.appendTolerations[5].value",
+				"test.overrideAffinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].preferences.matchFields[0].key",
+				"test.overrideAffinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].preferences.matchFields[1].key",
+				"test.overrideAffinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].preferences.matchExpressions[0].key",
+				"test.overrideAffinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].preferences.matchExpressions[1].key",
+				"test.overrideAffinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchFields[0].key",
+				"test.overrideAffinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchFields[1].key",
+				"test.overrideAffinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key",
+				"test.overrideAffinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[1].key",
+				"test.overrideAffinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution[0].labelSelector.matchLabels", // This one is from upstream.
+				"test.overrideAffinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution[0].labelSelector.matchExpressions[0].key",
+				"test.overrideAffinity.podAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].podAffinityTerm.namespaceSelector.matchExpressions[0].key",
+				"test.overrideAffinity.podAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].podAffinityTerm.namespaceSelector.matchExpressions[1].key",
+				"test.overrideAffinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution[0].labelSelector.matchExpressions[0].key",
+				"test.overrideAffinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].podAffinityTerm.namespaceSelector.matchExpressions[0].key",
+				"test.overrideAffinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].podAffinityTerm.namespaceSelector.matchExpressions[1].key",
+			}),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := validateAgentDeploymentCustomization(tt.args.customization, tt.args.path)
+			tt.validateFunc(t, got)
+		})
+	}
+}
+
+func Test_validateAgentSchedulingCustomizationPriorityClass(t *testing.T) {
+	preemptionNever := k8sv1.PreemptionPolicy("Never")
+	preemptionInvalid := k8sv1.PreemptionPolicy("rancher")
+
+	tests := []struct {
+		name           string
+		oldPC          *v1.PriorityClassSpec
+		pc             *v1.PriorityClassSpec
+		featureEnabled bool
+		shouldSucceed  bool
+	}{
+		{
+			name:           "empty priority class - feature enabled",
+			pc:             nil,
+			shouldSucceed:  true,
+			featureEnabled: true,
+		},
+		{
+			name:           "empty priority class - feature disabled",
+			pc:             nil,
+			shouldSucceed:  true,
+			featureEnabled: true,
+		},
+		{
+			name:           "valid priority class with default preemption",
+			shouldSucceed:  true,
+			featureEnabled: true,
+			pc: &v1.PriorityClassSpec{
+				Value: 123456,
+			},
+		},
+		{
+			name:           "valid priority class with custom preemption",
+			shouldSucceed:  true,
+			featureEnabled: true,
+			pc: &v1.PriorityClassSpec{
+				Value:            123456,
+				PreemptionPolicy: &preemptionNever,
+			},
+		},
+		{
+			name:           "invalid priority class - value too large",
+			shouldSucceed:  false,
+			featureEnabled: true,
+			pc: &v1.PriorityClassSpec{
+				Value: 1234567891234567890,
+			},
+		},
+		{
+			name:           "invalid priority class - value too small",
+			shouldSucceed:  false,
+			featureEnabled: true,
+			pc: &v1.PriorityClassSpec{
+				Value: -1234567891234567890,
+			},
+		},
+		{
+			name:           "invalid priority class - preemption value invalid",
+			shouldSucceed:  false,
+			featureEnabled: true,
+			pc: &v1.PriorityClassSpec{
+				Value:            24321,
+				PreemptionPolicy: &preemptionInvalid,
+			},
+		},
+		{
+			name:           "invalid priority class - feature is disabled",
+			shouldSucceed:  false,
+			featureEnabled: false,
+			pc: &v1.PriorityClassSpec{
+				Value:            24321,
+				PreemptionPolicy: &preemptionInvalid,
+			},
+		},
+		{
+			name:           "invalid update attempt - feature is disabled",
+			shouldSucceed:  false,
+			featureEnabled: false,
+			oldPC: &v1.PriorityClassSpec{
+				Value: 1234,
+			},
+			pc: &v1.PriorityClassSpec{
+				Value: 4321,
+			},
+		},
+		{
+			name:           "valid update attempt - feature is enabled",
+			shouldSucceed:  false,
+			featureEnabled: false,
+			oldPC: &v1.PriorityClassSpec{
+				Value: 1234,
+			},
+			pc: &v1.PriorityClassSpec{
+				Value: 4321,
+			},
+		},
+		{
+			name:           "valid update attempt - feature is disabled, but fields are unchanged",
+			shouldSucceed:  true,
+			featureEnabled: false,
+			oldPC: &v1.PriorityClassSpec{
+				Value: 1234,
+			},
+			pc: &v1.PriorityClassSpec{
+				Value: 1234,
+			},
+		},
+		{
+			name:           "valid update attempt - field is removed while feature is disabled",
+			shouldSucceed:  true,
+			featureEnabled: false,
+			oldPC: &v1.PriorityClassSpec{
+				Value: 1234,
+			},
+			pc: nil,
+		},
+	}
+
+	t.Parallel()
+	for _, agentType := range common.AllAgentTypes {
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				ctrl := gomock.NewController(t)
+				a := provisioningAdmitter{
+					featureCache: createMockFeatureCache(ctrl, common.SchedulingCustomizationFeatureName, tt.featureEnabled),
+				}
+
+				var oldCluster, cluster *v1.Cluster
+				switch agentType {
+				case common.AgentTypeCluster:
+					oldCluster = &v1.Cluster{
+						Spec: v1.ClusterSpec{
+							ClusterAgentDeploymentCustomization: &v1.AgentDeploymentCustomization{
+								SchedulingCustomization: &v1.AgentSchedulingCustomization{
+									PriorityClass: tt.oldPC,
+								},
+							},
+						},
+					}
+					cluster = &v1.Cluster{
+						Spec: v1.ClusterSpec{
+							ClusterAgentDeploymentCustomization: &v1.AgentDeploymentCustomization{
+								SchedulingCustomization: &v1.AgentSchedulingCustomization{
+									PriorityClass: tt.pc,
+								},
+							},
+						},
+					}
+				case common.AgentTypeFleet:
+					oldCluster = &v1.Cluster{
+						Spec: v1.ClusterSpec{
+							FleetAgentDeploymentCustomization: &v1.AgentDeploymentCustomization{
+								SchedulingCustomization: &v1.AgentSchedulingCustomization{
+									PriorityClass: tt.oldPC,
+								},
+							},
+						},
+					}
+					cluster = &v1.Cluster{
+						Spec: v1.ClusterSpec{
+							FleetAgentDeploymentCustomization: &v1.AgentDeploymentCustomization{
+								SchedulingCustomization: &v1.AgentSchedulingCustomization{
+									PriorityClass: tt.pc,
+								},
+							},
+						},
+					}
+				}
+
+				response, err := a.validatePriorityClass(oldCluster, cluster)
+				assert.Equal(t, tt.shouldSucceed, response.Allowed)
+				assert.NoError(t, err)
+			})
+		}
+	}
+}
+
+func Test_validateAgentSchedulingCustomizationPodDisruptionBudget(t *testing.T) {
+	tests := []struct {
+		name           string
+		pdb            *v1.PodDisruptionBudgetSpec
+		oldPdb         *v1.PodDisruptionBudgetSpec
+		featureEnabled bool
+		shouldSucceed  bool
+	}{
+		{
+			name:           "no scheduling customization - feature enabled",
+			pdb:            nil,
+			shouldSucceed:  true,
+			featureEnabled: true,
+		},
+		{
+			name:           "no scheduling customization - feature disabled",
+			pdb:            nil,
+			shouldSucceed:  true,
+			featureEnabled: false,
+		},
+		{
+			name:           "invalid PDB configuration - negative min available integer",
+			shouldSucceed:  false,
+			featureEnabled: true,
+			pdb: &v1.PodDisruptionBudgetSpec{
+				MinAvailable: "-1",
+			},
+		},
+		{
+			name:           "invalid PDB configuration - negative max unavailable integer",
+			shouldSucceed:  false,
+			featureEnabled: true,
+			pdb: &v1.PodDisruptionBudgetSpec{
+				MaxUnavailable: "-1",
+			},
+		},
+		{
+			name:           "invalid PDB configuration - both fields set",
+			shouldSucceed:  false,
+			featureEnabled: true,
+			pdb: &v1.PodDisruptionBudgetSpec{
+				MaxUnavailable: "1",
+				MinAvailable:   "1",
+			},
+		},
+		{
+			name:           "invalid PDB configuration - string passed to max unavailable",
+			shouldSucceed:  false,
+			featureEnabled: true,
+			pdb: &v1.PodDisruptionBudgetSpec{
+				MaxUnavailable: "five",
+			},
+		},
+		{
+			name:           "invalid PDB configuration - string passed to min available",
+			shouldSucceed:  false,
+			featureEnabled: true,
+			pdb: &v1.PodDisruptionBudgetSpec{
+				MinAvailable: "five",
+			},
+		},
+		{
+			name:           "invalid PDB configuration - string with invalid percentage number set for min available",
+			shouldSucceed:  false,
+			featureEnabled: true,
+			pdb: &v1.PodDisruptionBudgetSpec{
+				MinAvailable: "5.5%",
+			},
+		},
+		{
+			name:           "invalid PDB configuration - string with invalid percentage number set for max unavailable",
+			shouldSucceed:  false,
+			featureEnabled: true,
+			pdb: &v1.PodDisruptionBudgetSpec{
+				MaxUnavailable: "5.5%",
+			},
+		},
+		{
+			name:           "invalid PDB configuration - both set to zero",
+			shouldSucceed:  false,
+			featureEnabled: true,
+			pdb: &v1.PodDisruptionBudgetSpec{
+				MinAvailable:   "0",
+				MaxUnavailable: "0",
+			},
+		},
+		{
+			name:           "valid PDB configuration - max unavailable set to integer",
+			shouldSucceed:  true,
+			featureEnabled: true,
+			pdb: &v1.PodDisruptionBudgetSpec{
+				MaxUnavailable: "1",
+			},
+		},
+		{
+			name:           "valid PDB configuration - min available set to integer",
+			shouldSucceed:  true,
+			featureEnabled: true,
+			pdb: &v1.PodDisruptionBudgetSpec{
+				MinAvailable: "1",
+			},
+		},
+		{
+			name:           "valid PDB configuration - min available set to integer",
+			shouldSucceed:  true,
+			featureEnabled: true,
+			pdb: &v1.PodDisruptionBudgetSpec{
+				MinAvailable:   "1",
+				MaxUnavailable: "0",
+			},
+		},
+		{
+			name:           "valid PDB configuration - max unavailable set to integer",
+			shouldSucceed:  true,
+			featureEnabled: true,
+			pdb: &v1.PodDisruptionBudgetSpec{
+				MinAvailable:   "0",
+				MaxUnavailable: "1",
+			},
+		},
+		{
+			name:           "valid PDB configuration - max unavailable set to percentage",
+			shouldSucceed:  true,
+			featureEnabled: true,
+			pdb: &v1.PodDisruptionBudgetSpec{
+				MaxUnavailable: "50%",
+			},
+		},
+		{
+			name:           "valid PDB configuration - min available set to percentage",
+			shouldSucceed:  true,
+			featureEnabled: true,
+			pdb: &v1.PodDisruptionBudgetSpec{
+				MinAvailable: "50%",
+			},
+		},
+		{
+			name:           "valid PDB configuration - updating from percentage to int",
+			shouldSucceed:  true,
+			featureEnabled: true,
+			oldPdb: &v1.PodDisruptionBudgetSpec{
+				MinAvailable: "50%",
+			},
+			pdb: &v1.PodDisruptionBudgetSpec{
+				MinAvailable: "1",
+			},
+		},
+		{
+			name:           "invalid PDB reconfiguration - feature is disabled",
+			shouldSucceed:  false,
+			featureEnabled: false,
+			oldPdb: &v1.PodDisruptionBudgetSpec{
+				MinAvailable: "50%",
+			},
+			pdb: &v1.PodDisruptionBudgetSpec{
+				MinAvailable: "1",
+			},
+		},
+		{
+			name:           "invalid PDB creation - feature is disabled",
+			shouldSucceed:  false,
+			featureEnabled: false,
+			oldPdb:         nil,
+			pdb: &v1.PodDisruptionBudgetSpec{
+				MinAvailable: "1",
+			},
+		},
+		{
+			name:           "valid PDB reconfiguration - field is removed while feature is disabled",
+			shouldSucceed:  true,
+			featureEnabled: false,
+			oldPdb: &v1.PodDisruptionBudgetSpec{
+				MinAvailable: "50%",
+			},
+			pdb: nil,
+		},
+		{
+			name:           "valid update - field is unchanged while feature is disabled",
+			shouldSucceed:  true,
+			featureEnabled: false,
+			oldPdb: &v1.PodDisruptionBudgetSpec{
+				MinAvailable: "50%",
+			},
+			pdb: &v1.PodDisruptionBudgetSpec{
+				MinAvailable: "50%",
+			},
+		},
+	}
+
+	t.Parallel()
+	for _, agentType := range common.AllAgentTypes {
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				ctrl := gomock.NewController(t)
+				a := provisioningAdmitter{
+					featureCache: createMockFeatureCache(ctrl, common.SchedulingCustomizationFeatureName, tt.featureEnabled),
+				}
+
+				var oldCluster, cluster *v1.Cluster
+
+				switch agentType {
+				case common.AgentTypeCluster:
+					oldCluster = &v1.Cluster{
+						Spec: v1.ClusterSpec{
+							ClusterAgentDeploymentCustomization: &v1.AgentDeploymentCustomization{
+								SchedulingCustomization: &v1.AgentSchedulingCustomization{
+									PodDisruptionBudget: tt.oldPdb,
+								},
+							},
+						},
+					}
+					cluster = &v1.Cluster{
+						Spec: v1.ClusterSpec{
+							ClusterAgentDeploymentCustomization: &v1.AgentDeploymentCustomization{
+								SchedulingCustomization: &v1.AgentSchedulingCustomization{
+									PodDisruptionBudget: tt.pdb,
+								},
+							},
+						},
+					}
+				case common.AgentTypeFleet:
+					oldCluster = &v1.Cluster{
+						Spec: v1.ClusterSpec{
+							FleetAgentDeploymentCustomization: &v1.AgentDeploymentCustomization{
+								SchedulingCustomization: &v1.AgentSchedulingCustomization{
+									PodDisruptionBudget: tt.oldPdb,
+								},
+							},
+						},
+					}
+					cluster = &v1.Cluster{
+						Spec: v1.ClusterSpec{
+							FleetAgentDeploymentCustomization: &v1.AgentDeploymentCustomization{
+								SchedulingCustomization: &v1.AgentSchedulingCustomization{
+									PodDisruptionBudget: tt.pdb,
+								},
+							},
+						},
+					}
+				}
+
+				response, err := a.validatePodDisruptionBudget(oldCluster, cluster)
+				assert.Equal(t, tt.shouldSucceed, response.Allowed)
+				assert.NoError(t, err)
+			})
+		}
+	}
+}
+
+func createMockFeatureCache(ctrl *gomock.Controller, featureName string, enabled bool) *fake.MockNonNamespacedCacheInterface[*v3.Feature] {
+	featureCache := fake.NewMockNonNamespacedCacheInterface[*v3.Feature](ctrl)
+	featureCache.EXPECT().Get(featureName).DoAndReturn(func(string) (*v3.Feature, error) {
+		return &v3.Feature{
+			Spec: v3.FeatureSpec{
+				Value: &enabled,
+			},
+		}, nil
+	}).AnyTimes()
+	return featureCache
+}
+
+func createMockSecretClient(ctrl *gomock.Controller) *fake.MockControllerInterface[*k8sv1.Secret, *k8sv1.SecretList] {
+	secretClient := fake.NewMockControllerInterface[*k8sv1.Secret, *k8sv1.SecretList](ctrl)
+	secretClient.EXPECT().Get("fleet-default", "credential-from-client", gomock.Any()).Return(
+		&k8sv1.Secret{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "Secret",
+				APIVersion: "v1",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "fleet-default",
+				Name:      "credential-from-client",
+			},
+		}, nil).AnyTimes()
+	secretClient.EXPECT().Get("fleet-default", "non-exist", gomock.Any()).Return(
+		nil, apierrors.NewNotFound(k8sv1.Resource("secret"), "secret")).AnyTimes()
+
+	return secretClient
+}
+
+func createMockSecretCache(ctrl *gomock.Controller) *fake.MockCacheInterface[*k8sv1.Secret] {
+	secretCache := fake.NewMockCacheInterface[*k8sv1.Secret](ctrl)
+	secretCache.EXPECT().Get("fleet-default", "credential-from-cache").Return(
+		&k8sv1.Secret{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "Secret",
+				APIVersion: "v1",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "fleet-default",
+				Name:      "credential-from-cache",
+			},
+		}, nil).AnyTimes()
+	secretCache.EXPECT().Get("fleet-default", "credential-from-client").Return(
+		nil, apierrors.NewNotFound(k8sv1.Resource("secret"), "secret")).AnyTimes()
+	secretCache.EXPECT().Get("fleet-default", "non-exist").Return(
+		nil, apierrors.NewNotFound(k8sv1.Resource("secret"), "secret")).AnyTimes()
+
+	return secretCache
+}
+
+func Test_validateS3Secret(t *testing.T) {
+	tests := []struct {
+		name          string
+		cluster       *v1.Cluster
+		oldCluster    *v1.Cluster
+		shouldSucceed bool
+	}{
+		{
+			name:          "valid - s3 credential is changed and exists",
+			shouldSucceed: true,
+			oldCluster: &v1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "fleet-default",
+					Name:      "testing-cluster",
+				},
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							ETCD: &rkev1.ETCD{
+								S3: &rkev1.ETCDSnapshotS3{
+									CloudCredentialName: "old-secret",
+								},
+							},
+						},
+					},
+				},
+			},
+			cluster: &v1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "fleet-default",
+					Name:      "testing-cluster",
+				},
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							ETCD: &rkev1.ETCD{
+								S3: &rkev1.ETCDSnapshotS3{
+									CloudCredentialName: "credential-from-client",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:          "invalid - s3 credential is changed and does not exist",
+			shouldSucceed: false,
+			oldCluster: &v1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "fleet-default",
+					Name:      "testing-cluster",
+				},
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							ETCD: &rkev1.ETCD{
+								S3: &rkev1.ETCDSnapshotS3{
+									CloudCredentialName: "old-secret",
+								},
+							},
+						},
+					},
+				},
+			},
+			cluster: &v1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "fleet-default",
+					Name:      "testing-cluster",
+				},
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							ETCD: &rkev1.ETCD{
+								S3: &rkev1.ETCDSnapshotS3{
+									CloudCredentialName: "non-exist",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:          "valid - s3 credential remains the same and exists",
+			shouldSucceed: true,
+			oldCluster: &v1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "fleet-default",
+					Name:      "testing-cluster",
+				},
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							ETCD: &rkev1.ETCD{
+								S3: &rkev1.ETCDSnapshotS3{
+									CloudCredentialName: "credential-from-cache",
+								},
+							},
+						},
+					},
+				},
+			},
+			cluster: &v1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "fleet-default",
+					Name:      "testing-cluster",
+				},
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							ETCD: &rkev1.ETCD{
+								S3: &rkev1.ETCDSnapshotS3{
+									CloudCredentialName: "credential-from-cache",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:          "invalid - s3 credential does not exist",
+			shouldSucceed: false,
+			oldCluster:    &v1.Cluster{},
+			cluster: &v1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "fleet-default",
+					Name:      "testing-cluster",
+				},
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							ETCD: &rkev1.ETCD{
+								S3: &rkev1.ETCDSnapshotS3{
+									CloudCredentialName: "non-exist",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:          "valid - s3 credential can be found in cache",
+			shouldSucceed: true,
+			oldCluster:    &v1.Cluster{},
+			cluster: &v1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "fleet-default",
+					Name:      "testing-cluster",
+				},
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							ETCD: &rkev1.ETCD{
+								S3: &rkev1.ETCDSnapshotS3{
+									CloudCredentialName: "credential-from-cache",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:          "valid - s3 credential can be found in client",
+			shouldSucceed: true,
+			oldCluster:    &v1.Cluster{},
+			cluster: &v1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "fleet-default",
+					Name:      "testing-cluster",
+				},
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							ETCD: &rkev1.ETCD{
+								S3: &rkev1.ETCDSnapshotS3{
+									CloudCredentialName: "credential-from-client",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:          "valid - s3 credential is empty string",
+			shouldSucceed: true,
+			oldCluster:    &v1.Cluster{},
+			cluster: &v1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "fleet-default",
+					Name:      "testing-cluster",
+				},
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{
+						ClusterConfiguration: rkev1.ClusterConfiguration{
+							ETCD: &rkev1.ETCD{
+								S3: &rkev1.ETCDSnapshotS3{
+									CloudCredentialName: "",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	t.Parallel()
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			a := provisioningAdmitter{
+				secretClient: createMockSecretClient(ctrl),
+				secretCache:  createMockSecretCache(ctrl),
+			}
+
+			response, err := a.validateS3Secret(tt.oldCluster, tt.cluster)
+			assert.Equal(t, tt.shouldSucceed, response.Allowed)
+			assert.NoError(t, err)
+		})
+	}
+}
+
+func Test_ValidateRKEConfigChanged(t *testing.T) {
+	tests := []struct {
+		name       string
+		op         admissionv1.Operation
+		oldCluster *v1.Cluster
+		newCluster *v1.Cluster
+		expected   bool
+	}{
+		{
+			name:       "create",
+			op:         admissionv1.Create,
+			oldCluster: &v1.Cluster{},
+			newCluster: &v1.Cluster{},
+			expected:   true,
+		},
+		{
+			name:       "delete",
+			op:         admissionv1.Delete,
+			oldCluster: &v1.Cluster{},
+			newCluster: &v1.Cluster{},
+			expected:   true,
+		},
+		{
+			name:       "no change - nil",
+			op:         admissionv1.Update,
+			oldCluster: &v1.Cluster{},
+			newCluster: &v1.Cluster{},
+			expected:   true,
+		},
+		{
+			name:       "no change - nil - local",
+			op:         admissionv1.Update,
+			oldCluster: &v1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "local"}},
+			newCluster: &v1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "local"}},
+			expected:   true,
+		},
+		{
+			name: "no change - not nil",
+			op:   admissionv1.Update,
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+				},
+			},
+			newCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "no change - not nil - local",
+			op:   admissionv1.Update,
+			oldCluster: &v1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "local",
+				},
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+				},
+			},
+			newCluster: &v1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "local",
+				},
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+				},
+			},
+			expected: true,
+		},
+		{
+			name:       "change - was nil",
+			op:         admissionv1.Update,
+			oldCluster: &v1.Cluster{},
+			newCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "change - was nil - local",
+			op:   admissionv1.Update,
+			oldCluster: &v1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "local",
+				},
+			},
+			newCluster: &v1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "local",
+				},
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "change - was not nil",
+			op:   admissionv1.Update,
+			oldCluster: &v1.Cluster{
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+				},
+			},
+			newCluster: &v1.Cluster{},
+			expected:   false,
+		},
+		{
+			name: "change - was not nil - local",
+			op:   admissionv1.Update,
+			oldCluster: &v1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "local",
+				},
+				Spec: v1.ClusterSpec{
+					RKEConfig: &v1.RKEConfig{},
+				},
+			},
+			newCluster: &v1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "local",
+				},
+			},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			p := provisioningAdmitter{}
+			req := &admission.Request{
+				AdmissionRequest: admissionv1.AdmissionRequest{
+					Operation: tt.op,
+				},
+			}
+			response := p.validateRKEConfigChanged(req, tt.oldCluster, tt.newCluster)
+			if tt.expected {
+				assert.True(t, response.Allowed, "Expected change to be admitted")
+			} else {
+				assert.False(t, response.Allowed, "Expected change not to be admitted")
+			}
+		})
+	}
+}
+
+// generateTestMetadata is a helper to create the nested metadata string
+// as it's stored on the ETCDSnapshot object.
+func generateTestMetadata(clusterSpec *v1.ClusterSpec) (string, error) {
+	specBytes, err := json.Marshal(clusterSpec)
+	if err != nil {
+		return "", err
+	}
+
+	var gzipBuffer bytes.Buffer
+	gzipWriter := gzip.NewWriter(&gzipBuffer)
+	if _, err := gzipWriter.Write(specBytes); err != nil {
+		return "", err
+	}
+	if err := gzipWriter.Close(); err != nil {
+		return "", err
+	}
+
+	innerBase64 := base64.StdEncoding.EncodeToString(gzipBuffer.Bytes())
+
+	outerMap := map[string]string{
+		"provisioning-cluster-spec": innerBase64,
+	}
+
+	outerBytes, err := json.Marshal(outerMap)
+	if err != nil {
+		return "", err
+	}
+
+	return base64.StdEncoding.EncodeToString(outerBytes), nil
+}
+
+func TestValidateETCDSnapshotRestore(t *testing.T) {
+	asserts := assert.New(t)
+	requires := require.New(t)
+
+	const testNamespace = "test-ns"
+	const validAllSnapshotName = "valid-all-snapshot"
+	const validK8sSnapshotName = "valid-k8s-snapshot"
+	const invalidMetadataSnapshotName = "invalid-metadata-snapshot"
+	const missingK8sSnapshotName = "missing-k8s-snapshot"
+	const missingRKEConfigSnapshotName = "missing-rkeconfig-snapshot"
+	const nonExistentSnapshotName = "non-existent-snapshot"
+	const internalErrorSnapshotName = "internal-error-snapshot"
+
+	// Create reusable specs
+	validAllSpec := &v1.ClusterSpec{
+		KubernetesVersion: "v1.25.0",
+		RKEConfig:         &v1.RKEConfig{},
+	}
+	validK8sSpec := &v1.ClusterSpec{
+		KubernetesVersion: "v1.25.0",
+	}
+	missingK8sSpec := &v1.ClusterSpec{
+		RKEConfig: &v1.RKEConfig{},
+	}
+	missingRKEConfigSpec := &v1.ClusterSpec{
+		KubernetesVersion: "v1.25.0",
+	}
+
+	// Create reusable metadata strings
+	validAllMetadata, err := generateTestMetadata(validAllSpec)
+	requires.NoError(err)
+	validK8sMetadata, err := generateTestMetadata(validK8sSpec)
+	requires.NoError(err)
+	missingK8sMetadata, err := generateTestMetadata(missingK8sSpec)
+	requires.NoError(err)
+	missingRKEConfigMetadata, err := generateTestMetadata(missingRKEConfigSpec)
+	requires.NoError(err)
+
+	// Create reusable snapshot objects (fixtures for mock returns)
+	validAllSnapshot := &rkev1.ETCDSnapshot{
+		ObjectMeta:   metav1.ObjectMeta{Name: validAllSnapshotName, Namespace: testNamespace},
+		SnapshotFile: rkev1.ETCDSnapshotFile{Metadata: validAllMetadata},
+	}
+	validK8sSnapshot := &rkev1.ETCDSnapshot{
+		ObjectMeta:   metav1.ObjectMeta{Name: validK8sSnapshotName, Namespace: testNamespace},
+		SnapshotFile: rkev1.ETCDSnapshotFile{Metadata: validK8sMetadata},
+	}
+	invalidMetadataSnapshot := &rkev1.ETCDSnapshot{
+		ObjectMeta:   metav1.ObjectMeta{Name: invalidMetadataSnapshotName, Namespace: testNamespace},
+		SnapshotFile: rkev1.ETCDSnapshotFile{Metadata: "not-valid-at-all"},
+	}
+	missingK8sSnapshot := &rkev1.ETCDSnapshot{
+		ObjectMeta:   metav1.ObjectMeta{Name: missingK8sSnapshotName, Namespace: testNamespace},
+		SnapshotFile: rkev1.ETCDSnapshotFile{Metadata: missingK8sMetadata},
+	}
+	missingRKEConfigSnapshot := &rkev1.ETCDSnapshot{
+		ObjectMeta:   metav1.ObjectMeta{Name: missingRKEConfigSnapshotName, Namespace: testNamespace},
+		SnapshotFile: rkev1.ETCDSnapshotFile{Metadata: missingRKEConfigMetadata},
+	}
+
+	baseRequest := func() *admission.Request {
+		return &admission.Request{
+			AdmissionRequest: admissionv1.AdmissionRequest{
+				Operation: admissionv1.Update,
+				Object:    runtime.RawExtension{},
+				OldObject: runtime.RawExtension{},
+			},
+		}
+	}
+	baseCluster := func() *v1.Cluster {
+		return &v1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace},
+			Spec:       v1.ClusterSpec{},
+		}
+	}
+	withRestore := func(cluster *v1.Cluster, mode string, snapshotName string) *v1.Cluster {
+		cluster.Spec.RKEConfig = &v1.RKEConfig{
+			ETCDSnapshotRestore: &rkev1.ETCDSnapshotRestore{
+				Name:             snapshotName,
+				RestoreRKEConfig: mode,
+			},
+		}
+		return cluster
+	}
+
+	testCases := []struct {
+		name            string
+		request         *admission.Request
+		oldCluster      *v1.Cluster
+		newCluster      *v1.Cluster
+		mockSetup       func(mockCache *fake.MockCacheInterface[*rkev1.ETCDSnapshot])
+		expectAllowed   bool
+		expectedError   string // For internal, non-admission errors
+		expectedDenyMsg string // For admission.ResponseBadRequest
+	}{
+		{
+			name: "should allow on create operation",
+			request: &admission.Request{
+				AdmissionRequest: admissionv1.AdmissionRequest{
+					Operation: admissionv1.Create,
+				},
+			},
+			oldCluster:    nil,
+			newCluster:    baseCluster(),
+			expectAllowed: true,
+		},
+		{
+			name:          "should allow if new RKEConfig is nil",
+			request:       baseRequest(),
+			oldCluster:    baseCluster(),
+			newCluster:    baseCluster(), // Spec.RKEConfig is nil
+			expectAllowed: true,
+		},
+		{
+			name:       "should allow if new restore spec is nil",
+			request:    baseRequest(),
+			oldCluster: baseCluster(),
+			newCluster: func() *v1.Cluster {
+				cluster := baseCluster()
+				cluster.Spec.RKEConfig = &v1.RKEConfig{ETCDSnapshotRestore: nil}
+				return cluster
+			}(),
+			expectAllowed: true,
+		},
+		{
+			name:          "should allow if restore spec is unchanged",
+			request:       baseRequest(),
+			oldCluster:    withRestore(baseCluster(), "all", validAllSnapshotName),
+			newCluster:    withRestore(baseCluster(), "all", validAllSnapshotName),
+			expectAllowed: true,
+		},
+		{
+			name:          "should allow if new restore name is empty",
+			request:       baseRequest(),
+			oldCluster:    withRestore(baseCluster(), "all", validAllSnapshotName),
+			newCluster:    withRestore(baseCluster(), "all", ""), // <-- Name is empty
+			expectAllowed: true,
+		},
+		{
+			name:          "should allow if new restore mode is empty",
+			request:       baseRequest(),
+			oldCluster:    withRestore(baseCluster(), "all", validAllSnapshotName),
+			newCluster:    withRestore(baseCluster(), "", validAllSnapshotName), // <-- Mode is empty
+			expectAllowed: true,
+		},
+		{
+			name:          "CRITICAL: should allow unchanged spec even if snapshot is missing",
+			request:       baseRequest(),
+			oldCluster:    withRestore(baseCluster(), "all", nonExistentSnapshotName),
+			newCluster:    withRestore(baseCluster(), "all", nonExistentSnapshotName),
+			expectAllowed: true,
+		},
+		{
+			name:       "should deny if snapshot not found",
+			request:    baseRequest(),
+			oldCluster: baseCluster(),
+			newCluster: withRestore(baseCluster(), "all", nonExistentSnapshotName),
+			mockSetup: func(mockCache *fake.MockCacheInterface[*rkev1.ETCDSnapshot]) {
+				mockCache.EXPECT().Get(testNamespace, nonExistentSnapshotName).
+					Return(nil, apierrors.NewNotFound(rkev1.Resource("etcdsnapshot"), nonExistentSnapshotName))
+			},
+			expectAllowed:   false,
+			expectedDenyMsg: fmt.Sprintf("etcd restore references missing snapshot %s in namespace %s", nonExistentSnapshotName, testNamespace),
+		},
+		{
+			name:       "should return internal error if cache fails",
+			request:    baseRequest(),
+			oldCluster: baseCluster(),
+			newCluster: withRestore(baseCluster(), "all", internalErrorSnapshotName),
+			mockSetup: func(mockCache *fake.MockCacheInterface[*rkev1.ETCDSnapshot]) {
+				mockCache.EXPECT().Get(testNamespace, internalErrorSnapshotName).
+					Return(nil, fmt.Errorf("internal cache error"))
+			},
+			expectAllowed: false,
+			expectedError: "internal cache error",
+		},
+		{
+			name:       "should deny if metadata is invalid",
+			request:    baseRequest(),
+			oldCluster: baseCluster(),
+			newCluster: withRestore(baseCluster(), "all", invalidMetadataSnapshotName),
+			mockSetup: func(mockCache *fake.MockCacheInterface[*rkev1.ETCDSnapshot]) {
+				mockCache.EXPECT().Get(testNamespace, invalidMetadataSnapshotName).
+					Return(invalidMetadataSnapshot, nil)
+			},
+			expectAllowed:   false,
+			expectedDenyMsg: fmt.Sprintf("invalid ETCD snapshot metadata for %s/%s", testNamespace, invalidMetadataSnapshotName),
+		},
+		{
+			name:          "should allow restore mode 'none' without fetching snapshot",
+			request:       baseRequest(),
+			oldCluster:    baseCluster(),
+			newCluster:    withRestore(baseCluster(), "none", invalidMetadataSnapshotName),
+			expectAllowed: true,
+		},
+		{
+			name:       "should allow restore mode 'kubernetesVersion' with valid spec",
+			request:    baseRequest(),
+			oldCluster: baseCluster(),
+			newCluster: withRestore(baseCluster(), "kubernetesVersion", validK8sSnapshotName),
+			mockSetup: func(mockCache *fake.MockCacheInterface[*rkev1.ETCDSnapshot]) {
+				mockCache.EXPECT().Get(testNamespace, validK8sSnapshotName).
+					Return(validK8sSnapshot, nil)
+			},
+			expectAllowed: true,
+		},
+		{
+			name:       "should deny restore mode 'kubernetesVersion' with missing k8s version",
+			request:    baseRequest(),
+			oldCluster: baseCluster(),
+			newCluster: withRestore(baseCluster(), "kubernetesVersion", missingK8sSnapshotName),
+			mockSetup: func(mockCache *fake.MockCacheInterface[*rkev1.ETCDSnapshot]) {
+				mockCache.EXPECT().Get(testNamespace, missingK8sSnapshotName).
+					Return(missingK8sSnapshot, nil)
+			},
+			expectAllowed:   false,
+			expectedDenyMsg: "snapshot metadata missing KubernetesVersion for kubernetesVersion restore",
+		},
+		{
+			name:       "should allow restore mode 'all' with valid spec",
+			request:    baseRequest(),
+			oldCluster: baseCluster(),
+			newCluster: withRestore(baseCluster(), "all", validAllSnapshotName),
+			mockSetup: func(mockCache *fake.MockCacheInterface[*rkev1.ETCDSnapshot]) {
+				mockCache.EXPECT().Get(testNamespace, validAllSnapshotName).
+					Return(validAllSnapshot, nil)
+			},
+			expectAllowed: true,
+		},
+		{
+			name:       "should deny restore mode 'all' with missing RKEConfig",
+			request:    baseRequest(),
+			oldCluster: baseCluster(),
+			newCluster: withRestore(baseCluster(), "all", missingRKEConfigSnapshotName),
+			mockSetup: func(mockCache *fake.MockCacheInterface[*rkev1.ETCDSnapshot]) {
+				mockCache.EXPECT().Get(testNamespace, missingRKEConfigSnapshotName).
+					Return(missingRKEConfigSnapshot, nil)
+			},
+			expectAllowed:   false,
+			expectedDenyMsg: "snapshot metadata must include RKEConfig and KubernetesVersion for 'all' restore",
+		},
+		{
+			name:       "should deny unsupported restore mode",
+			request:    baseRequest(),
+			oldCluster: baseCluster(),
+			newCluster: withRestore(baseCluster(), "invalid-mode", validAllSnapshotName),
+			mockSetup: func(mockCache *fake.MockCacheInterface[*rkev1.ETCDSnapshot]) {
+				mockCache.EXPECT().Get(testNamespace, validAllSnapshotName).
+					Return(validAllSnapshot, nil)
+			},
+			expectAllowed:   false,
+			expectedDenyMsg: "unsupported restore mode invalid-mode",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			gomockController := gomock.NewController(t)
+			mockSnapshotCache := fake.NewMockCacheInterface[*rkev1.ETCDSnapshot](gomockController)
+			admitter := &provisioningAdmitter{
+				etcdSnapshotCache: mockSnapshotCache,
+			}
+
+			if testCase.mockSetup != nil {
+				testCase.mockSetup(mockSnapshotCache)
+			}
+
+			response, err := admitter.validateETCDSnapshotRestore(testCase.request, testCase.oldCluster, testCase.newCluster)
+
+			if testCase.expectedError != "" {
+				requires.Error(err)
+				requires.Contains(err.Error(), testCase.expectedError)
+				return
+			}
+
+			asserts.NoError(err, "unexpected internal error")
+
+			asserts.Equal(testCase.expectAllowed, response.Allowed)
+			if !testCase.expectAllowed && testCase.expectedDenyMsg != "" {
+				asserts.Contains(response.Result.Message, testCase.expectedDenyMsg)
+			}
+		})
+	}
+}
+
+func Test_validateWebhookDeploymentCustomization(t *testing.T) {
+	replicaCount := func(n int32) *int32 { return &n }
+
+	tests := []struct {
+		name          string
+		customization *v1.WebhookDeploymentCustomization
+		validateFunc  func(t *testing.T, err field.ErrorList)
+	}{
+		{
+			name:          "nil customization",
+			customization: nil,
+			validateFunc:  validateFailedPaths([]string{}),
+		},
+		{
+			name:          "empty customization",
+			customization: &v1.WebhookDeploymentCustomization{},
+			validateFunc:  validateFailedPaths([]string{}),
+		},
+		{
+			name: "valid replicaCount",
+			customization: &v1.WebhookDeploymentCustomization{
+				ReplicaCount: replicaCount(3),
+			},
+			validateFunc: validateFailedPaths([]string{}),
+		},
+		{
+			name: "replicaCount of 1 is valid",
+			customization: &v1.WebhookDeploymentCustomization{
+				ReplicaCount: replicaCount(1),
+			},
+			validateFunc: validateFailedPaths([]string{}),
+		},
+		{
+			name: "replicaCount of 0 is invalid",
+			customization: &v1.WebhookDeploymentCustomization{
+				ReplicaCount: replicaCount(0),
+			},
+			validateFunc: validateFailedPaths([]string{"test.replicaCount"}),
+		},
+		{
+			name: "negative replicaCount is invalid",
+			customization: &v1.WebhookDeploymentCustomization{
+				ReplicaCount: replicaCount(-1),
+			},
+			validateFunc: validateFailedPaths([]string{"test.replicaCount"}),
+		},
+		{
+			name: "valid tolerations",
+			customization: &v1.WebhookDeploymentCustomization{
+				AppendTolerations: []k8sv1.Toleration{
+					{Key: "cattle.io/node", Operator: k8sv1.TolerationOpExists},
+				},
+			},
+			validateFunc: validateFailedPaths([]string{}),
+		},
+		{
+			name: "invalid toleration key",
+			customization: &v1.WebhookDeploymentCustomization{
+				AppendTolerations: []k8sv1.Toleration{
+					{Key: "-invalid-key", Operator: k8sv1.TolerationOpExists},
+				},
+			},
+			validateFunc: validateFailedPaths([]string{
+				"test.appendTolerations[0].key",
+			}),
+		},
+		{
+			name: "invalid toleration operator",
+			customization: &v1.WebhookDeploymentCustomization{
+				AppendTolerations: []k8sv1.Toleration{
+					{Key: "Valid-key", Operator: "InvalidOperator", Value: "valid"},
+				},
+			},
+			validateFunc: validateFailedPaths([]string{
+				"test.appendTolerations[0].operator",
+			}),
+		},
+		{
+			name: "invalid toleration value",
+			customization: &v1.WebhookDeploymentCustomization{
+				AppendTolerations: []k8sv1.Toleration{
+					{Key: "Valid-key", Operator: k8sv1.TolerationOpEqual, Value: "invalid-[]-value"},
+				},
+			},
+			validateFunc: validateFailedPaths([]string{
+				"test.appendTolerations[0].value",
+			}),
+		},
+		{
+			name: "valid affinity",
+			customization: &v1.WebhookDeploymentCustomization{
+				OverrideAffinity: &k8sv1.Affinity{
+					NodeAffinity: &k8sv1.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &k8sv1.NodeSelector{
+							NodeSelectorTerms: []k8sv1.NodeSelectorTerm{
+								{
+									MatchExpressions: []k8sv1.NodeSelectorRequirement{
+										{Key: "kubernetes.io/arch", Operator: k8sv1.NodeSelectorOpIn, Values: []string{"amd64"}},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			validateFunc: validateFailedPaths([]string{}),
+		},
+		{
+			name: "invalid affinity label key",
+			customization: &v1.WebhookDeploymentCustomization{
+				OverrideAffinity: &k8sv1.Affinity{
+					NodeAffinity: &k8sv1.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &k8sv1.NodeSelector{
+							NodeSelectorTerms: []k8sv1.NodeSelectorTerm{
+								{
+									MatchExpressions: []k8sv1.NodeSelectorRequirement{
+										{Key: "-bad-key"},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			validateFunc: validateFailedPaths([]string{
+				"test.overrideAffinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key",
+			}),
+		},
+		{
+			name: "valid PDB with minAvailable only",
+			customization: &v1.WebhookDeploymentCustomization{
+				PodDisruptionBudget: &v1.PodDisruptionBudgetSpec{
+					MinAvailable: "1",
+				},
+			},
+			validateFunc: validateFailedPaths([]string{}),
+		},
+		{
+			name: "valid PDB with maxUnavailable only",
+			customization: &v1.WebhookDeploymentCustomization{
+				PodDisruptionBudget: &v1.PodDisruptionBudgetSpec{
+					MaxUnavailable: "1",
+				},
+			},
+			validateFunc: validateFailedPaths([]string{}),
+		},
+		{
+			name: "valid PDB with percentage",
+			customization: &v1.WebhookDeploymentCustomization{
+				PodDisruptionBudget: &v1.PodDisruptionBudgetSpec{
+					MinAvailable: "50%",
+				},
+			},
+			validateFunc: validateFailedPaths([]string{}),
+		},
+		{
+			name: "PDB both minAvailable and maxUnavailable set",
+			customization: &v1.WebhookDeploymentCustomization{
+				PodDisruptionBudget: &v1.PodDisruptionBudgetSpec{
+					MinAvailable:   "1",
+					MaxUnavailable: "1",
+				},
+			},
+			validateFunc: validateFailedPaths([]string{"test.podDisruptionBudget"}),
+		},
+		{
+			name: "PDB both set to zero",
+			customization: &v1.WebhookDeploymentCustomization{
+				PodDisruptionBudget: &v1.PodDisruptionBudgetSpec{
+					MinAvailable:   "0",
+					MaxUnavailable: "0",
+				},
+			},
+			validateFunc: validateFailedPaths([]string{"test.podDisruptionBudget"}),
+		},
+		{
+			name: "PDB both empty",
+			customization: &v1.WebhookDeploymentCustomization{
+				PodDisruptionBudget: &v1.PodDisruptionBudgetSpec{},
+			},
+			validateFunc: validateFailedPaths([]string{"test.podDisruptionBudget"}),
+		},
+		{
+			name: "PDB negative minAvailable",
+			customization: &v1.WebhookDeploymentCustomization{
+				PodDisruptionBudget: &v1.PodDisruptionBudgetSpec{
+					MinAvailable: "-1",
+				},
+			},
+			validateFunc: validateFailedPaths([]string{"test.podDisruptionBudget.minAvailable"}),
+		},
+		{
+			name: "PDB invalid percentage",
+			customization: &v1.WebhookDeploymentCustomization{
+				PodDisruptionBudget: &v1.PodDisruptionBudgetSpec{
+					MinAvailable: "200%",
+				},
+			},
+			validateFunc: validateFailedPaths([]string{"test.podDisruptionBudget.minAvailable"}),
+		},
+		{
+			name: "PDB negative maxUnavailable",
+			customization: &v1.WebhookDeploymentCustomization{
+				PodDisruptionBudget: &v1.PodDisruptionBudgetSpec{
+					MaxUnavailable: "-5",
+				},
+			},
+			validateFunc: validateFailedPaths([]string{"test.podDisruptionBudget.maxUnavailable"}),
+		},
+		{
+			name: "full valid customization",
+			customization: &v1.WebhookDeploymentCustomization{
+				ReplicaCount: replicaCount(3),
+				AppendTolerations: []k8sv1.Toleration{
+					{Key: "cattle.io/node", Operator: k8sv1.TolerationOpExists},
+				},
+				OverrideAffinity: &k8sv1.Affinity{
+					PodAntiAffinity: &k8sv1.PodAntiAffinity{
+						PreferredDuringSchedulingIgnoredDuringExecution: []k8sv1.WeightedPodAffinityTerm{
+							{
+								Weight: 100,
+								PodAffinityTerm: k8sv1.PodAffinityTerm{
+									LabelSelector: &metav1.LabelSelector{
+										MatchLabels: map[string]string{"app": "rancher-webhook"},
+									},
+									TopologyKey: "kubernetes.io/hostname",
+								},
+							},
+						},
+					},
+				},
+				OverrideResourceRequirements: &k8sv1.ResourceRequirements{},
+				PodDisruptionBudget: &v1.PodDisruptionBudgetSpec{
+					MinAvailable: "1",
+				},
+			},
+			validateFunc: validateFailedPaths([]string{}),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var replicaCount *int32
+			var tolerations []k8sv1.Toleration
+			var affinity *k8sv1.Affinity
+			var pdb *common.PDB
+			if tt.customization != nil {
+				replicaCount = tt.customization.ReplicaCount
+				tolerations = tt.customization.AppendTolerations
+				affinity = tt.customization.OverrideAffinity
+				if tt.customization.PodDisruptionBudget != nil {
+					pdb = &common.PDB{
+						MinAvailable:   tt.customization.PodDisruptionBudget.MinAvailable,
+						MaxUnavailable: tt.customization.PodDisruptionBudget.MaxUnavailable,
+					}
+				}
+			}
+			got := common.ValidateWebhookDeploymentCustomization(replicaCount, tolerations, affinity, pdb, field.NewPath("test"))
+			tt.validateFunc(t, got)
+		})
+	}
+}
+
+func TestValidatePSACTDryRun(t *testing.T) {
+	t.Parallel()
+
+	// On dry-run, the pure input checks (kubernetes version floor,
+	// template existence) must still run — invalid input is denied in the
+	// preview exactly as on a real request — while the checks against the
+	// mutator's side effects (the admission-config secret and the cluster
+	// fields derived from it) must skip, since the mutator does not
+	// perform them on dry-run. The nil secret cache proves the skip: any
+	// secret lookup would panic.
+	tests := []struct {
+		name         string
+		template     string
+		k8sVersion   string
+		templateMiss bool
+		wantDenied   bool
+	}{
+		{
+			name:       "valid template and version: allowed, secret checks skipped",
+			template:   "restricted",
+			k8sVersion: "v1.30.5+rke2r1",
+		},
+		{
+			name:         "nonexistent template: denied on dry-run too",
+			template:     "no-such-template",
+			k8sVersion:   "v1.30.5+rke2r1",
+			templateMiss: true,
+			wantDenied:   true,
+		},
+		{
+			name:       "version below 1.23: denied on dry-run too",
+			template:   "restricted",
+			k8sVersion: "v1.22.9+rke2r1",
+			wantDenied: true,
+		},
+		{
+			name:       "template cleared: allowed, secret-absence check skipped",
+			template:   "",
+			k8sVersion: "v1.30.5+rke2r1",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctrl := gomock.NewController(t)
+			psactCache := fake.NewMockNonNamespacedCacheInterface[*v3.PodSecurityAdmissionConfigurationTemplate](ctrl)
+			if tt.templateMiss {
+				psactCache.EXPECT().Get(tt.template).Return(nil,
+					apierrors.NewNotFound(schema.GroupResource{Group: "management.cattle.io", Resource: "podsecurityadmissionconfigurationtemplates"}, tt.template)).AnyTimes()
+			} else if tt.template != "" {
+				psactCache.EXPECT().Get(tt.template).Return(&v3.PodSecurityAdmissionConfigurationTemplate{}, nil).AnyTimes()
+			}
+			a := provisioningAdmitter{psactCache: psactCache}
+			resp := admissionv1.AdmissionResponse{}
+			cluster := &v1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "fleet-default"},
+				Spec: v1.ClusterSpec{
+					RKEConfig:         &v1.RKEConfig{},
+					KubernetesVersion: tt.k8sVersion,
+					DefaultPodSecurityAdmissionConfigurationTemplateName: tt.template,
+				},
+			}
+			req := &admission.Request{
+				AdmissionRequest: admissionv1.AdmissionRequest{
+					Operation: admissionv1.Create,
+					DryRun:    admission.Ptr(true),
+				},
+			}
+
+			err := a.validatePSACT(req, &resp, cluster)
+			assert.NoError(t, err)
+			if tt.wantDenied {
+				assert.NotNil(t, resp.Result, "invalid input must be denied on dry-run")
+			} else {
+				assert.Nil(t, resp.Result)
+			}
+		})
+	}
+}
+
+func TestValidateManagementClusterNameOnCreate(t *testing.T) {
+	t.Parallel()
+
+	const (
+		validName = "c-m-abcd1234"
+		provName  = "my-cluster"
+		provNS    = "fleet-default"
+	)
+	now := metav1.Now()
+	errBoom := fmt.Errorf("boom")
+
+	mgmtCluster := func(annotations map[string]string, deleting bool) *v3.Cluster {
+		c := &v3.Cluster{ObjectMeta: metav1.ObjectMeta{Name: validName, Annotations: annotations}}
+		if deleting {
+			c.DeletionTimestamp = &now
+		}
+		return c
+	}
+	ownedBy := func(ns, name string) map[string]string {
+		return map[string]string{
+			"objectset.rio.cattle.io/owner-gvk":       "provisioning.cattle.io/v1, Kind=Cluster",
+			"objectset.rio.cattle.io/owner-namespace": ns,
+			"objectset.rio.cattle.io/owner-name":      name,
+		}
+	}
+	provClusterWithStatus := func(name, ns, statusClusterName string) *v1.Cluster {
+		return &v1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Status:     v1.ClusterStatus{ClusterName: statusClusterName},
+		}
+	}
+	provCluster := func(name, ns, annotation string) *v1.Cluster {
+		return &v1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        name,
+				Namespace:   ns,
+				Annotations: map[string]string{mgmtClusterNameAnn: annotation},
+			},
+		}
+	}
+	notFound := apierrors.NewNotFound(schema.GroupResource{Group: "management.cattle.io", Resource: "clusters"}, validName)
+
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		setup       func(mgmt *fake.MockNonNamespacedClientInterface[*v3.Cluster, *v3.ClusterList], prov *fake.MockCacheInterface[*v1.Cluster])
+		wantAllowed bool
+		wantErr     bool
+	}{
+		{
+			name:        "annotation not set",
+			annotations: nil,
+			wantAllowed: true,
+		},
+		{
+			name:        "annotation empty",
+			annotations: map[string]string{mgmtClusterNameAnn: ""},
+			wantAllowed: true,
+		},
+		{
+			name:        "invalid format",
+			annotations: map[string]string{mgmtClusterNameAnn: "my-cluster"},
+		},
+		{
+			name:        "valid name and no conflict",
+			annotations: map[string]string{mgmtClusterNameAnn: validName},
+			setup: func(mgmt *fake.MockNonNamespacedClientInterface[*v3.Cluster, *v3.ClusterList], prov *fake.MockCacheInterface[*v1.Cluster]) {
+				mgmt.EXPECT().Get(validName, metav1.GetOptions{}).Return(nil, notFound)
+				prov.EXPECT().GetByIndex(mgmtClusterNameIndex, validName).Return(nil, nil)
+			},
+			wantAllowed: true,
+		},
+		{
+			name:        "management cluster exists without owner",
+			annotations: map[string]string{mgmtClusterNameAnn: validName},
+			setup: func(mgmt *fake.MockNonNamespacedClientInterface[*v3.Cluster, *v3.ClusterList], _ *fake.MockCacheInterface[*v1.Cluster]) {
+				mgmt.EXPECT().Get(validName, metav1.GetOptions{}).Return(mgmtCluster(nil, false), nil)
+			},
+		},
+		{
+			name:        "management cluster owned by another provisioning cluster",
+			annotations: map[string]string{mgmtClusterNameAnn: validName},
+			setup: func(mgmt *fake.MockNonNamespacedClientInterface[*v3.Cluster, *v3.ClusterList], _ *fake.MockCacheInterface[*v1.Cluster]) {
+				mgmt.EXPECT().Get(validName, metav1.GetOptions{}).Return(mgmtCluster(ownedBy(provNS, "someone-else"), false), nil)
+			},
+		},
+		{
+			name:        "management cluster owned by provisioning cluster with the same name in another namespace",
+			annotations: map[string]string{mgmtClusterNameAnn: validName},
+			setup: func(mgmt *fake.MockNonNamespacedClientInterface[*v3.Cluster, *v3.ClusterList], _ *fake.MockCacheInterface[*v1.Cluster]) {
+				mgmt.EXPECT().Get(validName, metav1.GetOptions{}).Return(mgmtCluster(ownedBy("other-ns", provName), false), nil)
+			},
+		},
+		{
+			name:        "management cluster owner has a different kind",
+			annotations: map[string]string{mgmtClusterNameAnn: validName},
+			setup: func(mgmt *fake.MockNonNamespacedClientInterface[*v3.Cluster, *v3.ClusterList], _ *fake.MockCacheInterface[*v1.Cluster]) {
+				owned := ownedBy(provNS, provName)
+				owned["objectset.rio.cattle.io/owner-gvk"] = "v1, Kind=Secret"
+				mgmt.EXPECT().Get(validName, metav1.GetOptions{}).Return(mgmtCluster(owned, false), nil)
+			},
+		},
+		{
+			name:        "management cluster owned by the same provisioning cluster (restore)",
+			annotations: map[string]string{mgmtClusterNameAnn: validName},
+			setup: func(mgmt *fake.MockNonNamespacedClientInterface[*v3.Cluster, *v3.ClusterList], prov *fake.MockCacheInterface[*v1.Cluster]) {
+				mgmt.EXPECT().Get(validName, metav1.GetOptions{}).Return(mgmtCluster(ownedBy(provNS, provName), false), nil)
+				prov.EXPECT().GetByIndex(mgmtClusterNameIndex, validName).Return(nil, nil)
+			},
+			wantAllowed: true,
+		},
+		{
+			name:        "management cluster owned by the same provisioning cluster but being deleted",
+			annotations: map[string]string{mgmtClusterNameAnn: validName},
+			setup: func(mgmt *fake.MockNonNamespacedClientInterface[*v3.Cluster, *v3.ClusterList], _ *fake.MockCacheInterface[*v1.Cluster]) {
+				mgmt.EXPECT().Get(validName, metav1.GetOptions{}).Return(mgmtCluster(ownedBy(provNS, provName), true), nil)
+			},
+		},
+		{
+			name:        "the cluster in the request is the only one with the name",
+			annotations: map[string]string{mgmtClusterNameAnn: validName},
+			setup: func(mgmt *fake.MockNonNamespacedClientInterface[*v3.Cluster, *v3.ClusterList], prov *fake.MockCacheInterface[*v1.Cluster]) {
+				mgmt.EXPECT().Get(validName, metav1.GetOptions{}).Return(nil, notFound)
+				prov.EXPECT().GetByIndex(mgmtClusterNameIndex, validName).Return([]*v1.Cluster{
+					provCluster(provName, provNS, validName),
+				}, nil)
+			},
+			wantAllowed: true,
+		},
+		{
+			name:        "another provisioning cluster requests the same name",
+			annotations: map[string]string{mgmtClusterNameAnn: validName},
+			setup: func(mgmt *fake.MockNonNamespacedClientInterface[*v3.Cluster, *v3.ClusterList], prov *fake.MockCacheInterface[*v1.Cluster]) {
+				mgmt.EXPECT().Get(validName, metav1.GetOptions{}).Return(nil, notFound)
+				prov.EXPECT().GetByIndex(mgmtClusterNameIndex, validName).Return([]*v1.Cluster{
+					provCluster("other", "other-ns", validName),
+				}, nil)
+			},
+		},
+		{
+			name:        "another provisioning cluster already uses the name in its status",
+			annotations: map[string]string{mgmtClusterNameAnn: validName},
+			setup: func(mgmt *fake.MockNonNamespacedClientInterface[*v3.Cluster, *v3.ClusterList], prov *fake.MockCacheInterface[*v1.Cluster]) {
+				mgmt.EXPECT().Get(validName, metav1.GetOptions{}).Return(nil, notFound)
+				prov.EXPECT().GetByIndex(mgmtClusterNameIndex, validName).Return([]*v1.Cluster{
+					provClusterWithStatus("other", provNS, validName),
+				}, nil)
+			},
+		},
+		{
+			name:        "another provisioning cluster conflicts while the management cluster is restored",
+			annotations: map[string]string{mgmtClusterNameAnn: validName},
+			setup: func(mgmt *fake.MockNonNamespacedClientInterface[*v3.Cluster, *v3.ClusterList], prov *fake.MockCacheInterface[*v1.Cluster]) {
+				mgmt.EXPECT().Get(validName, metav1.GetOptions{}).Return(mgmtCluster(ownedBy(provNS, provName), false), nil)
+				prov.EXPECT().GetByIndex(mgmtClusterNameIndex, validName).Return([]*v1.Cluster{
+					provCluster("other", provNS, validName),
+				}, nil)
+			},
+		},
+		{
+			name:        "management cluster lookup fails",
+			annotations: map[string]string{mgmtClusterNameAnn: validName},
+			setup: func(mgmt *fake.MockNonNamespacedClientInterface[*v3.Cluster, *v3.ClusterList], _ *fake.MockCacheInterface[*v1.Cluster]) {
+				mgmt.EXPECT().Get(validName, metav1.GetOptions{}).Return(nil, errBoom)
+			},
+			wantErr: true,
+		},
+		{
+			name:        "provisioning cluster index lookup fails",
+			annotations: map[string]string{mgmtClusterNameAnn: validName},
+			setup: func(mgmt *fake.MockNonNamespacedClientInterface[*v3.Cluster, *v3.ClusterList], prov *fake.MockCacheInterface[*v1.Cluster]) {
+				mgmt.EXPECT().Get(validName, metav1.GetOptions{}).Return(nil, notFound)
+				prov.EXPECT().GetByIndex(mgmtClusterNameIndex, validName).Return(nil, errBoom)
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctrl := gomock.NewController(t)
+			mgmt := fake.NewMockNonNamespacedClientInterface[*v3.Cluster, *v3.ClusterList](ctrl)
+			prov := fake.NewMockCacheInterface[*v1.Cluster](ctrl)
+			if tt.setup != nil {
+				tt.setup(mgmt, prov)
+			}
+			a := provisioningAdmitter{mgmtClusterClient: mgmt, provClusterCache: prov}
+
+			cluster := &v1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{Name: provName, Namespace: provNS, Annotations: tt.annotations},
+			}
+			req := &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Create}}
+
+			resp, err := a.validateManagementClusterName(req, nil, cluster)
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantAllowed, resp.Allowed)
+		})
+	}
+}
+
+func TestRequestedMgmtNameRegex(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{name: "letters and numbers", value: "c-m-abcd1234", want: true},
+		{name: "only letters", value: "c-m-abcdefgh", want: true},
+		{name: "only numbers", value: "c-m-12345678", want: true},
+		{name: "starts with a number", value: "c-m-1bcd1234", want: true},
+		{name: "ends with a number", value: "c-m-abcdefg1", want: true},
+		{name: "hyphen in the middle", value: "c-m-ab-d-23x"},
+		{name: "missing prefix", value: "my-cluster"},
+		{name: "legacy name format", value: "c-abcde"},
+		{name: "local", value: "local"},
+		{name: "prefix only", value: "c-m-"},
+		{name: "7 characters after the prefix", value: "c-m-abcd123"},
+		{name: "9 characters after the prefix", value: "c-m-abcd12345"},
+		{name: "uppercase character", value: "c-m-ABCD1234"},
+		{name: "underscore character", value: "c-m-abcd_234"},
+		{name: "starts with hyphen after the prefix", value: "c-m--bcd1234"},
+		{name: "ends with hyphen", value: "c-m-abcd123-"},
+		{name: "63 characters", value: "c-m-" + strings.Repeat("a", 59)},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, requestedMgmtNameRegex.MatchString(tt.value))
+		})
+	}
+}
+
+func TestProvClusterByMgmtClusterName(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		statusName  string
+		want        []string
+	}{
+		{name: "no annotation and no status"},
+		{name: "annotation empty", annotations: map[string]string{mgmtClusterNameAnn: ""}},
+		{name: "status only", statusName: "c-m-abcd1234", want: []string{"c-m-abcd1234"}},
+		{name: "annotation only", annotations: map[string]string{mgmtClusterNameAnn: "c-m-abcd1234"}, want: []string{"c-m-abcd1234"}},
+		{
+			name:        "annotation and status differ",
+			annotations: map[string]string{mgmtClusterNameAnn: "c-m-abcd1234"},
+			statusName:  "c-m-wxyz5678",
+			want:        []string{"c-m-abcd1234", "c-m-wxyz5678"},
+		},
+		{
+			name:        "annotation and status are equal",
+			annotations: map[string]string{mgmtClusterNameAnn: "c-m-abcd1234"},
+			statusName:  "c-m-abcd1234",
+			want:        []string{"c-m-abcd1234"},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := provClusterByMgmtClusterName(&v1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{Annotations: tt.annotations},
+				Status:     v1.ClusterStatus{ClusterName: tt.statusName},
+			})
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestValidateManagementClusterNameOnUpdate(t *testing.T) {
+	t.Parallel()
+
+	withAnnotations := func(annotations map[string]string) *v1.Cluster {
+		return &v1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "my-cluster", Namespace: "fleet-default", Annotations: annotations}}
+	}
+
+	tests := []struct {
+		name        string
+		oldCluster  *v1.Cluster
+		newCluster  *v1.Cluster
+		wantAllowed bool
+	}{
+		{
+			name:        "no annotation before and after",
+			oldCluster:  withAnnotations(nil),
+			newCluster:  withAnnotations(map[string]string{"other": "value"}),
+			wantAllowed: true,
+		},
+		{
+			name:        "annotation unchanged",
+			oldCluster:  withAnnotations(map[string]string{mgmtClusterNameAnn: "c-m-abcd1234"}),
+			newCluster:  withAnnotations(map[string]string{mgmtClusterNameAnn: "c-m-abcd1234", "other": "value"}),
+			wantAllowed: true,
+		},
+		{
+			name:        "annotation unchanged and invalid",
+			oldCluster:  withAnnotations(map[string]string{mgmtClusterNameAnn: "anything"}),
+			newCluster:  withAnnotations(map[string]string{mgmtClusterNameAnn: "anything"}),
+			wantAllowed: true,
+		},
+		{
+			name:        "annotation unchanged and empty",
+			oldCluster:  withAnnotations(map[string]string{mgmtClusterNameAnn: ""}),
+			newCluster:  withAnnotations(map[string]string{mgmtClusterNameAnn: ""}),
+			wantAllowed: true,
+		},
+		{
+			name:       "annotation value changed",
+			oldCluster: withAnnotations(map[string]string{mgmtClusterNameAnn: "c-m-abcd1234"}),
+			newCluster: withAnnotations(map[string]string{mgmtClusterNameAnn: "c-m-wxyz5678"}),
+		},
+		{
+			name:       "annotation removed",
+			oldCluster: withAnnotations(map[string]string{mgmtClusterNameAnn: "c-m-abcd1234"}),
+			newCluster: withAnnotations(nil),
+		},
+		{
+			name:       "annotation added",
+			oldCluster: withAnnotations(nil),
+			newCluster: withAnnotations(map[string]string{mgmtClusterNameAnn: "c-m-abcd1234"}),
+		},
+		{
+			name:       "annotation set to empty",
+			oldCluster: withAnnotations(map[string]string{mgmtClusterNameAnn: "c-m-abcd1234"}),
+			newCluster: withAnnotations(map[string]string{mgmtClusterNameAnn: ""}),
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			// No mocks are set. The update path must not call any client or cache.
+			a := provisioningAdmitter{}
+			req := &admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Update}}
+
+			resp, err := a.validateManagementClusterName(req, tt.oldCluster, tt.newCluster)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantAllowed, resp.Allowed)
+			if !tt.wantAllowed {
+				require.NotNil(t, resp.Result)
+				assert.Contains(t, resp.Result.Message, "immutable")
+			}
+		})
+	}
+}
+
+// TestAdmitRejectsChangesAfterManagementClusterNameCheck is a regression test. The management cluster name check
+// must not replace the response that later checks use to report their failure.
+func TestAdmitRejectsChangesAfterManagementClusterNameCheck(t *testing.T) {
+	t.Parallel()
+
+	toRaw := func(cluster *v1.Cluster) runtime.RawExtension {
+		raw, err := json.Marshal(cluster)
+		require.NoError(t, err)
+		return runtime.RawExtension{Raw: raw}
+	}
+	oldCluster := &v1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "my-cluster", Namespace: "fleet-default"}}
+	newCluster := oldCluster.DeepCopy()
+	newCluster.Annotations = map[string]string{common.CreatorIDAnn: "foobar"}
+
+	admitter := &provisioningAdmitter{}
+	response, err := admitter.Admit(&admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Operation: admissionv1.Update,
+			Object:    toRaw(newCluster),
+			OldObject: toRaw(oldCluster),
+		},
+	})
+	require.NoError(t, err)
+	assert.False(t, response.Allowed)
+}

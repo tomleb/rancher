@@ -1,0 +1,77 @@
+## Validation Checks
+
+### Escalation Prevention
+
+Users can only create/update ClusterRoleTemplateBindings which grant permissions to RoleTemplates with rights less than or equal to those they currently possess. This is to prevent privilege escalation.
+`clusterScopedRules` inherited from project RoleTemplates are not granted by ClusterRoleTemplateBindings, so they are neither required nor counted as held.
+For external RoleTemplates (RoleTemplates with `external` set to `true`), if the `external-rules` feature flag is enabled and `ExternalRules` is specified in the roleTemplate in `RoleTemplateName`,
+`ExternalRules` will be used for authorization. Otherwise (if the feature flag is off or `ExternalRules` are nil), the rules from the backing `ClusterRole` in the local cluster will be used.
+
+### Invalid Fields - Create
+
+Users cannot create ClusterRoleTemplateBindings which violate the following constraints:
+- Either a user subject (through `UserName` or `UserPrincipalName`) or a group subject (through `GroupName` or `GroupPrincipalName`) must be specified; both a user subject and a group subject cannot be specified
+- `ClusterName` must:
+  - Be provided as a non-empty value
+  - Match the namespace of the ClusterRoleTemplateBinding
+  - Refer to an existing cluster
+- The roleTemplate indicated in `RoleTemplateName` must be:
+  - Provided as a non-empty value
+  - Valid (i.e. is an existing `roleTemplate` object of given name in the `management.cattle.io/v3` API group)
+  - Not locked (i.e. `roleTemplate.Locked` must be `false`)
+  - Associated with its appropriate context (`roleTemplate.Context` must be equal to "cluster")
+- If the label indicating ownership by a GlobalRoleBinding (`authz.management.cattle.io/grb-owner`) exists, it must refer to a valid (existing and not deleting) GlobalRoleBinding
+
+### Invalid Fields - Update
+
+Users cannot update the following fields after creation:
+- RoleTemplateName
+- ClusterName
+- The label indicating ownership by a GlobalRoleBinding (`authz.management.cattle.io/grb-owner`)
+
+Users can update the following fields if they have not been set, but after they have been set they cannot be changed:
+- UserName
+- UserPrincipalName
+- GroupName
+- GroupPrincipalName
+
+In addition, as in the create validation, both a user subject and a group subject cannot be specified.
+
+If the binding is being deleted (has a non-nil `DeletionTimestamp`) and its RoleTemplate can't be found, updates that pass the
+field checks above skip the escalation check. This also applies to a missing inherited RoleTemplate, and to a missing ClusterRole
+for an external RoleTemplate without `externalRules`. This lets finalizers be removed after the RoleTemplate is deleted.
+
+### Duplicate ClusterRoleTemplateBinding Prevention
+
+On creation, the webhook prevents the creation of a `ClusterRoleTemplateBinding` if another one already exists with the same subject and role in the same cluster. 
+This ensures that a user or group is not granted the same cluster-level role multiple times.
+
+A binding is considered a duplicate if another `ClusterRoleTemplateBinding` exists with the exact same values for:
+- `clusterName`
+- `roleTemplateName`
+- The subject, which is determined by one of the following fields:
+  - `userName`
+  - `userPrincipalName`
+  - `groupName`
+  - `groupPrincipalName`
+
+## Mutations
+
+### Deterministic Name Generation
+
+On `CREATE`, when `metadata.generateName` is set and `metadata.name` is empty, the mutating webhook replaces the server-side random name generation with a deterministic name derived from the binding's content. The generated name is:
+
+```
+<generateName prefix> + lowercase(base32(sha256(subject + "/" + roleTemplateName + "/" + clusterName))[:10])
+```
+
+The subject is selected using the following priority order:
+1. `userPrincipalName`
+2. `userName`
+3. `groupPrincipalName`
+4. `groupName`
+
+This ensures that two identical concurrent requests produce the same `metadata.name`, causing the Kubernetes API server to reject the second request with a `409 Conflict`. This prevents duplicate `ClusterRoleTemplateBinding` resources from being created by race conditions.
+
+If `metadata.name` is already set (i.e. the caller explicitly chose a name), no mutation is performed.
+

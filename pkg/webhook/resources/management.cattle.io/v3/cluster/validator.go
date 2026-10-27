@@ -1,0 +1,531 @@
+package cluster
+
+import (
+	"fmt"
+	"net/http"
+	"reflect"
+	"strconv"
+
+	apisv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
+	v3 "github.com/rancher/rancher/pkg/generated/controllers/management.cattle.io/v3"
+	objectsv3 "github.com/rancher/rancher/pkg/webhook/generated/objects/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/webhook/resources/common"
+	"github.com/rancher/webhook/pkg/admission"
+	admissionv1 "k8s.io/api/admission/v1"
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	authenticationv1 "k8s.io/api/authentication/v1"
+	v1 "k8s.io/api/authorization/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	authorizationv1 "k8s.io/client-go/kubernetes/typed/authorization/v1"
+)
+
+const (
+	localCluster             = "local"
+	VersionManagementAnno    = "rancher.io/imported-cluster-version-management"
+	VersionManagementSetting = "imported-cluster-version-management"
+)
+
+// NewValidator returns a new validator for management clusters.
+func NewValidator(
+	sar authorizationv1.SubjectAccessReviewInterface,
+	cache v3.PodSecurityAdmissionConfigurationTemplateCache,
+	userCache v3.UserCache,
+	featureCache v3.FeatureCache,
+	settingCache v3.SettingCache,
+) *Validator {
+	return &Validator{
+		admitter: admitter{
+			sar:          sar,
+			psact:        cache,
+			userCache:    userCache, // userCache is nil for downstream clusters.
+			featureCache: featureCache,
+			settingCache: settingCache, // settingCache is nil for downstream clusters
+		},
+	}
+}
+
+// Validator ValidatingWebhook for management clusters.
+type Validator struct {
+	admitter admitter
+}
+
+// GVR returns the GroupVersionKind for this CRD.
+func (v *Validator) GVR() schema.GroupVersionResource {
+	return managementGVR
+}
+
+// Operations returns list of operations handled by this validator.
+func (v *Validator) Operations() []admissionregistrationv1.OperationType {
+	return []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update, admissionregistrationv1.Delete}
+}
+
+// ValidatingWebhook returns the ValidatingWebhook used for this CRD.
+func (v *Validator) ValidatingWebhook(clientConfig admissionregistrationv1.WebhookClientConfig) []admissionregistrationv1.ValidatingWebhook {
+	valWebhook := admission.NewDefaultValidatingWebhook(v, clientConfig, admissionregistrationv1.ClusterScope, v.Operations())
+	valWebhook.FailurePolicy = admission.Ptr(admissionregistrationv1.Ignore)
+	return []admissionregistrationv1.ValidatingWebhook{*valWebhook}
+}
+
+// Admitters returns the admitter objects used to validate clusters.
+func (v *Validator) Admitters() []admission.Admitter {
+	return []admission.Admitter{&v.admitter}
+}
+
+type admitter struct {
+	sar          authorizationv1.SubjectAccessReviewInterface
+	psact        v3.PodSecurityAdmissionConfigurationTemplateCache
+	userCache    v3.UserCache
+	featureCache v3.FeatureCache
+	settingCache v3.SettingCache
+}
+
+// Admit handles the webhook admission request sent to this webhook.
+func (a *admitter) Admit(request *admission.Request) (*admissionv1.AdmissionResponse, error) {
+	oldCluster, newCluster, err := objectsv3.ClusterOldAndNewFromRequest(&request.AdmissionRequest)
+	if err != nil {
+		return nil, fmt.Errorf("failed get old and new clusters from request: %w", err)
+	}
+
+	if request.Operation == admissionv1.Delete && oldCluster.Name == localCluster {
+		// deleting "local" cluster could corrupt the cluster Rancher is deployed in
+		return admission.ResponseBadRequest("local cluster may not be deleted"), nil
+	}
+
+	response, err := a.validateFleetPermissions(request, oldCluster, newCluster)
+	if err != nil {
+		return nil, fmt.Errorf("failed to validate fleet permissions: %w", err)
+	}
+	if !response.Allowed {
+		return response, nil
+	}
+
+	if a.userCache != nil {
+		// The following checks don't make sense for downstream clusters (userCache == nil)
+		switch request.Operation {
+		case admissionv1.Create:
+			if fieldErr := common.CheckCreatorIDAndNoCreatorRBAC(newCluster); fieldErr != nil {
+				return admission.ResponseBadRequest(fieldErr.Error()), nil
+			}
+			fieldErr, err := common.CheckCreatorPrincipalName(a.userCache, newCluster)
+			if err != nil {
+				return nil, fmt.Errorf("error checking creator principal: %w", err)
+			}
+			if fieldErr != nil {
+				return admission.ResponseBadRequest(fieldErr.Error()), nil
+			}
+		case admissionv1.Update:
+			if fieldErr := common.CheckCreatorAnnotationsOnUpdate(oldCluster, newCluster); fieldErr != nil {
+				return admission.ResponseBadRequest(fieldErr.Error()), nil
+			}
+		}
+	}
+
+	if response, err = a.validatePodDisruptionBudget(oldCluster, newCluster, request.Operation); err != nil || !response.Allowed {
+		return response, err
+	}
+
+	if response, err = a.validatePriorityClass(oldCluster, newCluster, request.Operation); err != nil || !response.Allowed {
+		return response, err
+	}
+
+	if response, err = a.validateWebhookDeploymentCustomization(newCluster); err != nil || !response.Allowed {
+		return response, err
+	}
+
+	if a.settingCache != nil {
+		// The following checks don't make sense for downstream clusters (settingCache == nil)
+		response, err = a.validateVersionManagementFeature(oldCluster, newCluster, request.Operation)
+		if err != nil {
+			return nil, fmt.Errorf("failed to validate version management feature: %w", err)
+		}
+		if !response.Allowed {
+			return response, nil
+		}
+	}
+
+	return response, nil
+}
+
+func toExtra(extra map[string]authenticationv1.ExtraValue) map[string]v1.ExtraValue {
+	result := map[string]v1.ExtraValue{}
+	for k, v := range extra {
+		result[k] = v1.ExtraValue(v)
+	}
+	return result
+}
+
+// validateFleetPermissions validates whether the request maker has required permissions around FleetWorkspace.
+func (a *admitter) validateFleetPermissions(request *admission.Request, oldCluster, newCluster *apisv3.Cluster) (*admissionv1.AdmissionResponse, error) {
+	// Ensure that the FleetWorkspaceName field cannot be unset once it is set, as it would cause (likely unintentional)
+	// cluster deletion. Note that we're only enforcing this rule on UPDATE because Spec.FleetWorkspaceName will be
+	// empty on cluster deletion, which is fine.
+	fleetWorkspaceUnset := newCluster.Spec.FleetWorkspaceName == "" && oldCluster.Spec.FleetWorkspaceName != ""
+	if request.Operation == admissionv1.Update && fleetWorkspaceUnset {
+		return &admissionv1.AdmissionResponse{
+			Result: &metav1.Status{
+				Status:  "Failure",
+				Message: "once set, field FleetWorkspaceName cannot be made empty",
+				Reason:  metav1.StatusReasonInvalid,
+				Code:    http.StatusBadRequest,
+			},
+			Allowed: false,
+		}, nil
+	}
+
+	// If the FleetWorkspaceName is empty or unchanged, there's no need to make a SAR request.
+	if newCluster.Spec.FleetWorkspaceName == "" || oldCluster.Spec.FleetWorkspaceName == newCluster.Spec.FleetWorkspaceName {
+		return &admissionv1.AdmissionResponse{
+			Allowed: true,
+		}, nil
+	}
+
+	resp, err := a.sar.Create(request.Context, &v1.SubjectAccessReview{
+		Spec: v1.SubjectAccessReviewSpec{
+			ResourceAttributes: &v1.ResourceAttributes{
+				Verb:     "fleetaddcluster",
+				Version:  "v3",
+				Resource: "fleetworkspaces",
+				Group:    "management.cattle.io",
+				Name:     newCluster.Spec.FleetWorkspaceName,
+			},
+			User:   request.UserInfo.Username,
+			Groups: request.UserInfo.Groups,
+			Extra:  toExtra(request.UserInfo.Extra),
+			UID:    request.UserInfo.UID,
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to check SubjectAccessReview for cluster [%s]: %w", newCluster.Name, err)
+	}
+
+	if !resp.Status.Allowed {
+		return &admissionv1.AdmissionResponse{
+			Result: &metav1.Status{
+				Status:  "Failure",
+				Message: resp.Status.Reason,
+				Reason:  metav1.StatusReasonUnauthorized,
+				Code:    http.StatusUnauthorized,
+			},
+			Allowed: false,
+		}, nil
+	}
+
+	return admission.ResponseAllowed(), nil
+}
+
+// validatePriorityClass validates that the Priority Class defined in the cluster SchedulingCustomization field is properly
+// configured. The cluster-agent-scheduling-customization feature must be enabled to configure a Priority Class, however an existing
+// Priority Class may be deleted even if the feature is disabled.
+func (a *admitter) validatePriorityClass(oldCluster, newCluster *apisv3.Cluster, op admissionv1.Operation) (*admissionv1.AdmissionResponse, error) {
+	if op != admissionv1.Create && op != admissionv1.Update {
+		return admission.ResponseAllowed(), nil
+	}
+
+	for _, agentType := range common.AllAgentTypes {
+		newClusterScheduling := getSchedulingCustomization(newCluster, agentType)
+		oldClusterScheduling := getSchedulingCustomization(oldCluster, agentType)
+
+		var oldPC, newPC *apisv3.PriorityClassSpec
+		if newClusterScheduling != nil {
+			newPC = newClusterScheduling.PriorityClass
+		}
+		if oldClusterScheduling != nil {
+			oldPC = oldClusterScheduling.PriorityClass
+		}
+
+		resp, err := a.validateSinglePriorityClass(oldPC, newPC)
+		if err != nil || !resp.Allowed {
+			return resp, err
+		}
+	}
+
+	return admission.ResponseAllowed(), nil
+}
+
+// validateSinglePriorityClass contains the core validation logic for a single PriorityClass configuration, including
+// feature-gate handling. It is independent of where the PriorityClass comes from (cluster or fleet agent).
+func (a *admitter) validateSinglePriorityClass(oldPC, newPC *apisv3.PriorityClassSpec) (*admissionv1.AdmissionResponse, error) {
+	if newPC == nil {
+		return admission.ResponseAllowed(), nil
+	}
+
+	featuredEnabled, err := a.featureCache.Get(common.SchedulingCustomizationFeatureName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to determine status of '%s' feature", common.SchedulingCustomizationFeatureName)
+	}
+
+	enabled := featuredEnabled.Status.Default
+	if featuredEnabled.Spec.Value != nil {
+		enabled = *featuredEnabled.Spec.Value
+	}
+
+	// if the feature is disabled then we should not permit any changes between the old
+	// and new PriorityClass other than deletion
+	if !enabled && oldPC != nil {
+		if reflect.DeepEqual(*oldPC, *newPC) {
+			return admission.ResponseAllowed(), nil
+		}
+
+		return admission.ResponseBadRequest(fmt.Sprintf("'%s' feature is disabled, will only permit removal of Scheduling Customization fields until reenabled", common.SchedulingCustomizationFeatureName)), nil
+	}
+
+	if !enabled && oldPC == nil {
+		return admission.ResponseBadRequest(fmt.Sprintf("the '%s' feature must be enabled in order to configure a Priority Class or Pod Disruption Budget", common.SchedulingCustomizationFeatureName)), nil
+	}
+
+	if newPC.PreemptionPolicy != nil && *newPC.PreemptionPolicy != corev1.PreemptNever && *newPC.PreemptionPolicy != corev1.PreemptLowerPriority && *newPC.PreemptionPolicy != "" {
+		return admission.ResponseBadRequest("Priority Class Preemption value must be 'Never', 'PreemptLowerPriority', or empty"), nil
+	}
+
+	if newPC.Value > 1000000000 {
+		return admission.ResponseBadRequest("Priority Class value cannot be greater than 1 billion"), nil
+	}
+
+	if newPC.Value < -1000000000 {
+		return admission.ResponseBadRequest("Priority Class value cannot be less than negative 1 billion"), nil
+	}
+
+	return admission.ResponseAllowed(), nil
+}
+
+// validatePodDisruptionBudget validates that the Pod Disruption Budget defined in the cluster SchedulingCustomization field is properly
+// configured. The cluster-agent-scheduling-customization feature must be enabled to configure a Pod Disruption Budget, however an existing
+// Pod Disruption Budget may be deleted even if the feature is disabled.
+func (a *admitter) validatePodDisruptionBudget(oldCluster, newCluster *apisv3.Cluster, op admissionv1.Operation) (*admissionv1.AdmissionResponse, error) {
+	if op != admissionv1.Create && op != admissionv1.Update {
+		return admission.ResponseAllowed(), nil
+	}
+
+	for _, agentType := range common.AllAgentTypes {
+		newClusterScheduling := getSchedulingCustomization(newCluster, agentType)
+		oldClusterScheduling := getSchedulingCustomization(oldCluster, agentType)
+
+		var newPDB, oldPDB *apisv3.PodDisruptionBudgetSpec
+		if newClusterScheduling != nil {
+			newPDB = newClusterScheduling.PodDisruptionBudget
+		}
+		if oldClusterScheduling != nil {
+			oldPDB = oldClusterScheduling.PodDisruptionBudget
+		}
+
+		resp, err := a.validateSinglePodDisruptionBudget(oldPDB, newPDB)
+		if err != nil || !resp.Allowed {
+			return resp, err
+		}
+	}
+
+	return admission.ResponseAllowed(), nil
+}
+
+// validateSinglePodDisruptionBudget contains the core validation logic for a single PodDisruptionBudget configuration,
+// including feature-gate handling. It is independent of where the PDB comes from (cluster or fleet agent).
+func (a *admitter) validateSinglePodDisruptionBudget(oldPDB, newPDB *apisv3.PodDisruptionBudgetSpec) (*admissionv1.AdmissionResponse, error) {
+	if newPDB == nil {
+		return admission.ResponseAllowed(), nil
+	}
+
+	featuredEnabled, err := a.featureCache.Get(common.SchedulingCustomizationFeatureName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to determine status of '%s' feature", common.SchedulingCustomizationFeatureName)
+	}
+
+	enabled := featuredEnabled.Status.Default
+	if featuredEnabled.Spec.Value != nil {
+		enabled = *featuredEnabled.Spec.Value
+	}
+
+	// if the feature is disabled then we should not permit any changes between the old
+	// and new PDBs other than deletion
+	if !enabled && oldPDB != nil {
+		if reflect.DeepEqual(*oldPDB, *newPDB) {
+			return admission.ResponseAllowed(), nil
+		}
+
+		return admission.ResponseBadRequest(fmt.Sprintf("'%s' feature is disabled, will only permit removal of Scheduling Customization fields until reenabled", common.SchedulingCustomizationFeatureName)), nil
+	}
+
+	if !enabled && oldPDB == nil {
+		return admission.ResponseBadRequest(fmt.Sprintf("the '%s' feature must be enabled in order to configure a Priority Class or Pod Disruption Budget", common.SchedulingCustomizationFeatureName)), nil
+	}
+
+	minAvailStr := newPDB.MinAvailable
+	maxUnavailStr := newPDB.MaxUnavailable
+
+	if (minAvailStr == "" && maxUnavailStr == "") ||
+		(minAvailStr == "0" && maxUnavailStr == "0") ||
+		(minAvailStr != "" && minAvailStr != "0") && (maxUnavailStr != "" && maxUnavailStr != "0") {
+		return admission.ResponseBadRequest("both minAvailable and maxUnavailable cannot be set to a non zero value, at least one must be omitted or set to zero"), nil
+	}
+
+	minAvailIsString := false
+	maxUnavailIsString := false
+
+	minAvailInt, err := strconv.Atoi(minAvailStr)
+	if err != nil {
+		minAvailIsString = minAvailStr != ""
+	}
+
+	maxUnavailInt, err := strconv.Atoi(maxUnavailStr)
+	if err != nil {
+		maxUnavailIsString = maxUnavailStr != ""
+	}
+
+	if !minAvailIsString && minAvailInt < 0 {
+		return admission.ResponseBadRequest("minAvailable cannot be set to a negative integer"), nil
+	}
+
+	if !maxUnavailIsString && maxUnavailInt < 0 {
+		return admission.ResponseBadRequest("maxUnavailable cannot be set to a negative integer"), nil
+	}
+
+	if minAvailIsString && !common.PdbPercentageRegex.Match([]byte(minAvailStr)) {
+		return admission.ResponseBadRequest(fmt.Sprintf("minAvailable must be a non-negative whole integer or a percentage value between 0 and 100, regex used is '%s'", common.PdbPercentageRegex.String())), nil
+	}
+
+	if maxUnavailIsString && maxUnavailStr != "" && !common.PdbPercentageRegex.Match([]byte(maxUnavailStr)) {
+		return admission.ResponseBadRequest(fmt.Sprintf("minAvailable must be a non-negative whole integer or a percentage value between 0 and 100, regex used is '%s'", common.PdbPercentageRegex.String())), nil
+	}
+
+	return admission.ResponseAllowed(), nil
+}
+
+func (a *admitter) validateWebhookDeploymentCustomization(cluster *apisv3.Cluster) (*admissionv1.AdmissionResponse, error) {
+	wdc := cluster.Spec.WebhookDeploymentCustomization
+	if wdc == nil {
+		return admission.ResponseAllowed(), nil
+	}
+
+	var pdb *common.PDB
+	if wdc.PodDisruptionBudget != nil {
+		pdb = &common.PDB{MinAvailable: wdc.PodDisruptionBudget.MinAvailable, MaxUnavailable: wdc.PodDisruptionBudget.MaxUnavailable}
+	}
+
+	if errStatus := common.ErrorListToStatus(common.ValidateWebhookDeploymentCustomization(
+		wdc.ReplicaCount, wdc.AppendTolerations, wdc.OverrideAffinity, pdb,
+		field.NewPath("spec", "webhookDeploymentCustomization"))); errStatus != nil {
+		return &admissionv1.AdmissionResponse{
+			Result:  errStatus,
+			Allowed: false,
+		}, nil
+	}
+
+	return admission.ResponseAllowed(), nil
+}
+
+func getSchedulingCustomization(cluster *apisv3.Cluster, agent common.AgentType) *apisv3.AgentSchedulingCustomization {
+	if cluster == nil {
+		return nil
+	}
+
+	switch agent {
+	case common.AgentTypeCluster:
+		if cluster.Spec.ClusterAgentDeploymentCustomization == nil {
+			return nil
+		}
+
+		if cluster.Spec.ClusterAgentDeploymentCustomization.SchedulingCustomization == nil {
+			return nil
+		}
+
+		return cluster.Spec.ClusterAgentDeploymentCustomization.SchedulingCustomization
+
+	case common.AgentTypeFleet:
+		if cluster.Spec.FleetAgentDeploymentCustomization == nil {
+			return nil
+		}
+
+		if cluster.Spec.FleetAgentDeploymentCustomization.SchedulingCustomization == nil {
+			return nil
+		}
+
+		return cluster.Spec.FleetAgentDeploymentCustomization.SchedulingCustomization
+
+	default:
+		return nil
+	}
+}
+
+// validateVersionManagementFeature validates the annotation for the version management feature is set with valid value on the imported RKE2/K3s cluster;
+// Note the following:
+//   - no validation is done if the cluster is not an imported RKE2/K3s cluster;
+//   - a warning is emitted if `spec.rke2Config` or `spec.k3sConfig` is changed when the version management feature is disabled for the cluster.
+func (a *admitter) validateVersionManagementFeature(oldCluster, newCluster *apisv3.Cluster, op admissionv1.Operation) (*admissionv1.AdmissionResponse, error) {
+	if op != admissionv1.Create && op != admissionv1.Update {
+		return admission.ResponseAllowed(), nil
+	}
+
+	driver := newCluster.Status.Driver
+
+	if driver != apisv3.ClusterDriverRke2 && driver != apisv3.ClusterDriverK3s {
+		response := admission.ResponseAllowed()
+		return response, nil
+	}
+
+	// reaching this point indicates the cluster is an imported RKE2/K3s cluster
+	val, exist := newCluster.Annotations[VersionManagementAnno]
+	if !exist {
+		message := fmt.Sprintf("the %s annotation is missing", VersionManagementAnno)
+		return admission.ResponseBadRequest(message), nil
+	}
+	if val != "true" && val != "false" && val != "system-default" {
+		message := fmt.Sprintf("the value of the %s annotation must be one of the following: true, false, system-default", VersionManagementAnno)
+		return admission.ResponseBadRequest(message), nil
+	}
+	enabled, err := a.versionManagementEnabled(newCluster)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check the version management feature: %w", err)
+	}
+	response := admission.ResponseAllowed()
+	if !enabled && op == admissionv1.Update {
+		if driver == apisv3.ClusterDriverRke2 {
+			if !reflect.DeepEqual(oldCluster.Spec.Rke2Config, newCluster.Spec.Rke2Config) && newCluster.Spec.Rke2Config != nil {
+				msg := fmt.Sprintf("Cluster [%s]: changes to the Rke2Config field will take effect after the version management is enabled on the cluster", newCluster.Name)
+				response.Warnings = append(response.Warnings, msg)
+			}
+		}
+		if driver == apisv3.ClusterDriverK3s {
+			if !reflect.DeepEqual(oldCluster.Spec.K3sConfig, newCluster.Spec.K3sConfig) && newCluster.Spec.K3sConfig != nil {
+				msg := fmt.Sprintf("Cluster [%s]: changes to the K3sConfig field will take effect after the version management is enabled on the cluster", newCluster.Name)
+				response.Warnings = append(response.Warnings, msg)
+			}
+		}
+	}
+	return response, nil
+}
+
+func (a *admitter) versionManagementEnabled(cluster *apisv3.Cluster) (bool, error) {
+	if cluster == nil {
+		return false, fmt.Errorf("cluster is nil")
+	}
+	val, ok := cluster.Annotations[VersionManagementAnno]
+	if !ok {
+		return false, fmt.Errorf("the %s annotation is missing from the cluster", VersionManagementAnno)
+	}
+	if val == "true" {
+		return true, nil
+	}
+	if val == "false" {
+		return false, nil
+	}
+	if val == "system-default" {
+		s, err := a.settingCache.Get(VersionManagementSetting)
+		if err != nil {
+			return false, err
+		}
+		actual := s.Value
+		if actual == "" {
+			actual = s.Default
+		}
+		if actual == "true" {
+			return true, nil
+		}
+		if actual == "false" {
+			return false, nil
+		}
+		return false, fmt.Errorf("the value (%s) of the %s setting is invalid", actual, VersionManagementSetting)
+	}
+	return false, fmt.Errorf("the value of the %s annotation is invalid", VersionManagementAnno)
+}

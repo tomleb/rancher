@@ -1,0 +1,210 @@
+## Validation Checks
+
+### On Create
+
+#### Creator ID Annotation
+
+The annotation `field.cattle.io/creatorId` must be set to the Username of the User that initiated the request.
+
+If `field.cattle.io/no-creator-rbac` annotation is set, `field.cattle.io/creatorId` cannot be set.
+
+#### Management Cluster Name Annotation
+
+The annotation `provisioning.cattle.io/management-cluster-name` sets the name of the management cluster that Rancher creates.
+Rancher ignores an empty value. The webhook accepts an empty value and skips the checks in this section.
+
+If the annotation has a value, all of these conditions must be true:
+- The value has the format `c-m-<8 characters>`. Each of the 8 characters is a lowercase letter or a digit.
+- No other provisioning cluster sets the same value in this annotation or in `status.clusterName`.
+- No management cluster has this name.
+
+If a management cluster has this name, the webhook accepts the request only when both of these conditions are true:
+- The annotations `objectset.rio.cattle.io/owner-gvk`, `objectset.rio.cattle.io/owner-namespace` and `objectset.rio.cattle.io/owner-name` of the management cluster point to the provisioning cluster in the request.
+- The management cluster is not being deleted.
+
+This exception allows a restore from a backup, because the restore creates the management cluster before the provisioning cluster.
+
+#### NO_PROXY value
+
+Prevent the creation of new objects with an env var (under `spec.agentEnvVars`) with a name of `NO_PROXY` if its value contains one or more spaces. This ensures that the provided value adheres to
+the format expected by Go, and helps to prevent subtle issues elsewhere when writing scripts which utilize `NO_PROXY`.  
+
+#### Data Directories
+
+Prevent the creation of new objects with an env var (under `spec.agentEnvVars`) with a name of `CATTLE_AGENT_VAR_DIR`.
+Prevent the creation of new objects with an invalid data directory. An invalid data directory is defined as the 
+following:
+- Is not an absolute path (i.e. does not start with `/`)
+- Attempts to include environment variables (e.g. `$VARIABLE` or `${VARIABLE}`)
+- Attempts to include shell expressions (e.g. `$(command)` or `` `command` ``)
+- Equal to another data directory
+- Attempts to nest another data directory
+
+If the action is an update, and the old cluster had a `nil` `.spec.rkeConfig`, accept the request, since this is how rancherd operates, and is required for harvester installations.
+
+#### Etcd S3 CloudCredential Secret
+
+Prevent the creation of objects if the secret specified in `.spec.rkeConfig.etcd.s3.cloudCredentialName` does not exist.
+
+#### Machine Selector Files
+
+Prevent the creation of objects if the requesting user does not have `get` permission on each Secret or ConfigMap
+referenced by `spec.rkeConfig.machineSelectorFiles` in the cluster's namespace. These checks also apply to
+server-side dry-run requests.
+
+Access check results are cached for up to 10 seconds per user identity and source.
+
+The generated Pod Security Admission Configuration Template (PSACT) file entry is exempt when
+`spec.defaultPodSecurityAdmissionConfigurationTemplateName` is set and the entire entry matches the generated
+entry for this cluster, ignoring only hashes. A matching Secret name alone does not qualify.
+
+#### Pod Security Admission Configuration Template
+
+When `spec.defaultPodSecurityAdmissionConfigurationTemplateName` is set, the referenced
+`PodSecurityAdmissionConfigurationTemplate` must exist and the cluster's Kubernetes version must be 1.23 or above.
+The admission-configuration secret managed by the mutator, and the cluster fields derived from it, are also
+validated — except on server-side dry-run requests, where the mutator does not perform that secret management (see
+Mutation Checks); the template-existence and version checks still run on dry-run. The same applies on update, and
+the check that the secret was removed is skipped on dry-run deletes.
+
+### On Update
+
+#### Creator ID Annotation
+
+The annotation `field.cattle.io/creatorId` cannot be changed, but it can be removed.
+
+If `field.cattle.io/no-creator-rbac` annotation is set, `field.cattle.io/creatorId` cannot be set.
+
+#### Management Cluster Name Annotation
+
+The annotation `provisioning.cattle.io/management-cluster-name` cannot be added, changed or removed.
+
+#### RKEConfig changed
+
+The `spec.rkeConfig` field cannot be changed from `nil`/ not `nil` after creation.
+
+The local cluster is an exemption, as the rancherd use case allows managing the local cluster via this mechanism.
+
+#### Machine Selector Files
+
+The same access checks and PSACT exemption as on create apply to new or changed
+`spec.rkeConfig.machineSelectorFiles` entries. Entries are compared in full, including `machineLabelSelector` and
+item hashes, regardless of their position in the list.
+
+When the cluster's labels change, the same access checks also apply to unchanged entries whose source has the
+`rke.cattle.io/object-authorized-for-clusters-selector` annotation, including an empty value. This applies to any
+cluster label change. Missing unchanged sources are skipped for this additional check; other source lookup
+errors reject the request. New or changed entries still require access checks even when a source is missing.
+
+#### Data Directories
+
+On update, prevent new env vars with this name from being added but allow them to be removed. Rancher will perform 
+a one-time migration to move the system-agent data dir definition to the top level field from the `AgentEnvVars` 
+section. A secondary validator will ensure that the effective data directory for the `system-agent` is not different 
+from the one chosen during cluster creation. Additionally, the changing of a data directory for the `system-agent`, 
+kubernetes distro (RKE2/K3s), and CAPR components is also prohibited.
+
+#### cluster.spec.clusterAgentDeploymentCustomization and cluster.spec.fleetAgentDeploymentCustomization
+
+The `DeploymentCustomization` fields are of 3 types:
+- `appendTolerations`: adds tolerations to the appropriate deployment (cluster-agent/fleet-agent)
+- `affinity`: adds various affinities to the deployments, which include the following
+  - `nodeAffinity`: where to schedule the workload
+  - `podAffinitity` and `podAntiAffinity`: pods to avoid or prefer when scheduling the workload
+
+A `Toleration` is matched to a regex which is provided by upstream [apimachinery here](https://github.com/kubernetes/apimachinery/blob/02a41040d88da08de6765573ae2b1a51f424e1ca/pkg/apis/meta/v1/validation/validation.go#L96) but it boils down to this regex on the label:
+```regex
+([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]
+```
+
+For the `Affinity` based rules, the `podAffinity`/`podAntiAffinity` are validated via label selectors via [this apimachinery function](https://github.com/kubernetes/apimachinery/blob/02a41040d88da08de6765573ae2b1a51f424e1ca/pkg/apis/meta/v1/validation/validation.go#L56) whereas the `nodeAffinity` `nodeSelectorTerms` are validated via the same `Toleration` function.
+
+#### cluster.spec.clusterAgentDeploymentCustomization.schedulingCustomization and cluster.spec.fleetAgentDeploymentCustomization.schedulingCustomization
+
+The `SchedulingCustomization` subfield of the `DeploymentCustomization` field defines the properties of a Pod Disruption Budget and Priority Class which will be automatically deployed by Rancher for the cattle-cluster-agent.
+
+The `schedulingCustomization.PriorityClass` field contains two attributes
+
++ `value`: This must be an integer value equal to or between negative 1 billion and 1 billion.
++ `preemptionPolicy`: This must be a string value which indicates the desired preemption behavior, its value can be either `PreemptLowerPriority` or `Never`. Any other value must be rejected.
+
+The `schedulingCustomization.PodDisruptionBudget` field contains two attributes
+
++ `minAvailable`: This is a string value that indicates the minimum number of agent replicas that must be running at a given time.
++ `maxUnavailable`: This is a string value that indicates the maximum number of agent replicas that can be unavailable at a given time.
+
+Both `minAvailable` and `maxUnavailable` must be a string which represents a non-negative whole number, or a whole number percentage greater than or equal to `0%` and less than or equal to `100%`. Only one of the two fields can have a non-zero or empty value at a given time. These fields use the following regex when assessing if a given percentage value is valid:
+```regex
+^([0-9]|[1-9][0-9]|100)%$
+```
+
+#### cluster.spec.webhookDeploymentCustomization
+
+The `WebhookDeploymentCustomization` field configures the rancher-webhook deployment on downstream clusters. The following sub-fields are validated:
+
+- `replicaCount`: If set, must be at least 1.
+- `appendTolerations`: Toleration keys are validated against the same upstream apimachinery label name regex used for agent deployment customizations:
+  ```regex
+  ([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]
+  ```
+- `overrideAffinity`: Node affinity `nodeSelectorTerms` are validated via label name validation. Pod affinity and pod anti-affinity are validated via label selectors using the [apimachinery label selector validation](https://github.com/kubernetes/apimachinery/blob/02a41040d88da08de6765573ae2b1a51f424e1ca/pkg/apis/meta/v1/validation/validation.go#L56).
+- `podDisruptionBudget.minAvailable` and `podDisruptionBudget.maxUnavailable`: Each must be a non-negative whole integer or a whole number percentage between `0%` and `100%`. Only one of the two fields can have a non-zero or non-empty value at a given time. These fields use the following regex when assessing if a given percentage value is valid:
+  ```regex
+  ^([0-9]|[1-9][0-9]|100)%$
+  ```
+- `overrideResourceRequirements`: Not validated by the webhook — the Kubernetes API server validates `ResourceRequirements` natively.
+
+#### NO_PROXY value
+
+Prevent the update of objects with an env var (under `spec.agentEnvVars`) with a name of `NO_PROXY` if its value contains one or more spaces. This ensures that the provided value adheres to
+the format expected by Go, and helps to prevent subtle issues elsewhere when writing scripts which utilize `NO_PROXY`.  
+
+The only exception to this check is if the existing cluster already has a `NO_PROXY` variable which includes spaces in its value. In this case, update operations are permitted. If `NO_PROXY` is later updated to value which does not contain spaces, this exception will no longer occur.
+
+#### Etcd S3 CloudCredential Secret
+
+Prevent the update of objects if the secret specified in `.spec.rkeConfig.etcd.s3.cloudCredentialName` does not exist.
+
+#### ETCD Snapshot Restore
+
+Validation for `spec.rkeConfig.etcdSnapshotRestore` is only triggered when this field is changed to a new, non-empty value. This check is intentionally skipped if the field is unchanged, which prevents blocking unrelated cluster updates (e.g., node scaling) if the referenced snapshot is deleted *after* a successful restore.
+
+When triggered, the following checks are performed:
+
+* The referenced snapshot in `etcdSnapshotRestore.name` must exist in the same namespace as the cluster.
+* The `etcdSnapshotRestore.restoreRKEConfig` field must be a supported mode (`"none"`, `"kubernetesVersion"`, or `"all"`).
+* If `restoreRKEConfig` is **`"kubernetesVersion"`**, the snapshot's metadata must be parsable and contain a `kubernetesVersion`.
+* If `restoreRKEConfig` is **`"all"`**, the snapshot's metadata must be parsable and contain both `kubernetesVersion` and `rkeConfig`.
+
+## Mutation Checks
+
+### On Create
+
+#### Creator ID Annotation
+
+When a cluster is created `field.cattle.io/creatorId` is set to the Username from the request.
+
+If `field.cattle.io/no-creator-rbac` annotation is set, `field.cattle.io/creatorId` does not get set.
+
+This also applies to server-side dry-run creates: the annotation is set in the returned patch, so the Creator ID
+validation passes on a dry-run exactly as it does on a real create.
+
+#### Pod Security Admission Configuration Template
+
+When a cluster is created or updated with `spec.defaultPodSecurityAdmissionConfigurationTemplateName` set, the
+mutator manages an admission-configuration secret for the cluster and sets the machine selector file and
+kube-apiserver argument that mount it; when the field is cleared, the secret is deleted and those fields are
+dropped. On server-side dry-run requests the secret is neither written nor deleted, and the derived fields are not
+set or dropped — the corresponding validation of that state is skipped on dry-run as well (see Validation Checks).
+
+### On Update
+
+#### Dynamic Schema Drop
+
+Check for the presence of the `provisioning.cattle.io/allow-dynamic-schema-drop` annotation. If the value is `"true"`,
+perform no mutations. If the value is not present or not `"true"`, compare the value of the `dynamicSchemaSpec` field
+for each `machinePool`, to its' previous value. If the values are not identical, revert the value for the
+`dynamicSchemaSpec` for the specific `machinePool`, but do not reject the request.
+
+The revert also applies to server-side dry-run updates, so a dry-run preview matches what a real update would
+persist.

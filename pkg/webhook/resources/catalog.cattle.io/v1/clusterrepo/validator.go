@@ -6,7 +6,7 @@ import (
 	"fmt"
 
 	catalogv1 "github.com/rancher/rancher/pkg/apis/catalog.cattle.io/v1"
-	v1 "github.com/rancher/rancher/pkg/webhook/generated/objects/catalog.cattle.io/v1"
+	v1 "github.com/rancher/rancher/pkg/generated/objects/catalog.cattle.io/v1"
 	"github.com/rancher/webhook/pkg/admission"
 	admissionv1 "k8s.io/api/admission/v1"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"

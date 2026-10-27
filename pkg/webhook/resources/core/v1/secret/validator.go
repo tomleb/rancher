@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	objectsv1 "github.com/rancher/rancher/pkg/webhook/generated/objects/core/v1"
+	objectsv1 "github.com/rancher/rancher/pkg/generated/objects/core/v1"
 	"github.com/rancher/webhook/pkg/admission"
 	v1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/rbac/v1"
 	"github.com/sirupsen/logrus"

@@ -9,7 +9,7 @@ import (
 	"unicode/utf8"
 
 	ctrlv3 "github.com/rancher/rancher/pkg/generated/controllers/management.cattle.io/v3"
-	objectsv1 "github.com/rancher/rancher/pkg/webhook/generated/objects/core/v1"
+	objectsv1 "github.com/rancher/rancher/pkg/generated/objects/core/v1"
 	"github.com/rancher/rancher/pkg/webhook/resources/common"
 	"github.com/rancher/webhook/pkg/admission"
 	"github.com/rancher/webhook/pkg/patch"

@@ -6,7 +6,7 @@ import (
 
 	provv1 "github.com/rancher/rancher/pkg/apis/provisioning.cattle.io/v1"
 	provcontrollers "github.com/rancher/rancher/pkg/generated/controllers/provisioning.cattle.io/v1"
-	scaling "github.com/rancher/rancher/pkg/webhook/generated/objects/autoscaling/v1"
+	scaling "github.com/rancher/rancher/pkg/generated/objects/autoscaling/v1"
 	"github.com/rancher/webhook/pkg/admission"
 	"github.com/sirupsen/logrus"
 	jsonpatch "gopkg.in/evanphx/json-patch.v5"

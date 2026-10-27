@@ -3,7 +3,7 @@ package machineconfig
 import (
 	"fmt"
 
-	v1 "github.com/rancher/rancher/pkg/webhook/generated/objects/core/v1"
+	v1 "github.com/rancher/rancher/pkg/generated/objects/core/v1"
 	"github.com/rancher/rancher/pkg/webhook/resources/common"
 	"github.com/rancher/webhook/pkg/admission"
 	"github.com/rancher/webhook/pkg/patch"

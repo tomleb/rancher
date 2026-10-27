@@ -11,7 +11,7 @@ import (
 	provv1 "github.com/rancher/rancher/pkg/apis/provisioning.cattle.io/v1"
 	v3 "github.com/rancher/rancher/pkg/generated/controllers/management.cattle.io/v3"
 	v1 "github.com/rancher/rancher/pkg/generated/controllers/provisioning.cattle.io/v1"
-	objectsv3 "github.com/rancher/rancher/pkg/webhook/generated/objects/management.cattle.io/v3"
+	objectsv3 "github.com/rancher/rancher/pkg/generated/objects/management.cattle.io/v3"
 	"github.com/rancher/webhook/pkg/admission"
 	admissionv1 "k8s.io/api/admission/v1"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"

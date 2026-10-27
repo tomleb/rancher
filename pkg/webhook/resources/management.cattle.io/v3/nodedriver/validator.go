@@ -6,7 +6,7 @@ import (
 
 	"github.com/rancher/lasso/pkg/dynamic"
 	v3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
-	objectsv3 "github.com/rancher/rancher/pkg/webhook/generated/objects/management.cattle.io/v3"
+	objectsv3 "github.com/rancher/rancher/pkg/generated/objects/management.cattle.io/v3"
 	"github.com/rancher/webhook/pkg/admission"
 	admissionv1 "k8s.io/api/admission/v1"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"

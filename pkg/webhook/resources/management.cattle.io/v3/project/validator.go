@@ -8,7 +8,7 @@ import (
 
 	v3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	controllerv3 "github.com/rancher/rancher/pkg/generated/controllers/management.cattle.io/v3"
-	objectsv3 "github.com/rancher/rancher/pkg/webhook/generated/objects/management.cattle.io/v3"
+	objectsv3 "github.com/rancher/rancher/pkg/generated/objects/management.cattle.io/v3"
 	"github.com/rancher/rancher/pkg/webhook/resources/common"
 	"github.com/rancher/webhook/pkg/admission"
 	"github.com/rancher/wrangler/v3/pkg/data/convert"

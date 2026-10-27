@@ -30,6 +30,10 @@ import (
 func main() {
 	os.Unsetenv("GOPATH")
 
+	if err := generateWebhook(); err != nil {
+		panic(err)
+	}
+
 	controllergen.Run(args.Options{
 		OutputPackage: "github.com/rancher/rancher/pkg/plan/generated",
 		Boilerplate:   "scripts/boilerplate.go.txt",

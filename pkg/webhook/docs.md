@@ -1,0 +1,1186 @@
+# auditlog.cattle.io/v1
+
+## AuditPolicy
+
+### Validation Checks
+
+#### Invalid Fields - Create
+
+Users cannot create an `AuditPolicy` which violates the following constraints:
+
+- `.Spec.Filters[].Action` must be one of `allow` or `deny`
+- `.Spec.Filters[].RequestURI` must be valid regex
+- `.Spec.AdditionalRedactions[].Headers[]` must be valid regez
+- `.Spec.AdditionalRedactions[].Paths[]` must be valid jsonpath
+
+#### Invalid Fields - Update
+
+Users cannot update an `AuditPolicy` which violates the following constraints:
+
+- `.Spec.Filters[].Action` must be one of `allow` or `deny`
+- `.Spec.Filters[].RequestURI` must be valid regex
+- `.Spec.AdditionalRedactions[].Headers[]` must be valid regez
+- `.Spec.AdditionalRedactions[].Paths[]` must be valid jsonpath
+
+# catalog.cattle.io/v1
+
+## ClusterRepo
+
+### Validation Checks
+
+#### Invalid Fields - Create
+
+Users cannot create a ClusterRepo which violates the following constraints:
+
+- Fields GitRepo and URL are mutually exclusive and so both cannot be filled at once.
+
+#### Invalid Fields - Update
+
+Users cannot update a ClusterRepo which violates the following constraints:
+
+- Fields GitRepo and URL are mutually exclusive and so both cannot be filled at once.
+
+# cluster.cattle.io/v3
+
+## ClusterAuthToken
+
+### Validation Checks
+
+#### Invalid Fields - Create
+
+When a ClusterAuthToken is created, the following checks take place:
+
+- If set, `lastUsedAt` must be a valid date time according to RFC3339 (e.g. `2023-11-29T00:00:00Z`).
+
+#### Invalid Fields - Update
+
+When a ClusterAuthToken is updated, the following checks take place:
+
+- If set, `lastUsedAt` must be a valid date time according to RFC3339 (e.g. `2023-11-29T00:00:00Z`).
+
+# cluster.x-k8s.io/v1beta2
+
+## Scale
+
+### cluster.x-k8s.io/v1beta2
+
+#### MachineDeployment
+
+##### Validation Checks
+
+###### On Create and Update
+
+When a scale operation is performed on a MachineDeployment, the webhook synchronizes the replica count between the MachineDeployment and its corresponding machine pool in the Rancher provisioning cluster if it exists.
+
+**Synchronization Flow:**
+
+1. **Early Exit** - Skip synchronization if:
+   - Dry-run request is detected
+   - MachineDeployment doesn't exist
+   - Required labels are missing (`cluster.x-k8s.io/cluster-name` or `rke.cattle.io/rke-machine-pool-name`)
+
+2. **Cluster Resolution:**
+   - Extracts the CAPI cluster name from the `cluster.x-k8s.io/cluster-name` label
+   - Extracts the Rancher machine pool name from the `rke.cattle.io/rke-machine-pool-name` label
+   - Retrieves the CAPI Cluster object using the cluster name label
+   - Finds the Rancher Provisioning Cluster by checking owner references on the CAPI Cluster
+
+3. **Machine Pool Matching:**
+   - Validates the provisioning Cluster has RKEConfig and MachinePools configured
+   - Locates the matching machine pool by name in the provisioning Cluster's RKEConfig
+   - If not found, skips synchronization (no error)
+
+4. **Replica Synchronization:**
+   - Compares the replica count from the scale request with the machine pool's quantity
+   - If they differ, updates the machine pool's quantity to match the scale request
+   - Uses exponential backoff retry for update operations
+
+**Error Handling:**
+- Missing MachineDeployment: Admits the scale operation (not an error)
+- Missing labels: Skips synchronization silently
+- Missing CAPI Cluster: Admits the scale operation (not an error)
+- Missing Provisioning Cluster: Admits the scale operation (not an error)
+- Missing RKEConfig/MachinePools: Skips synchronization silently
+- Machine pool not found: Skips synchronization silently
+- Update failures: Returns error with escalation flag
+
+# core/v1
+
+## LimitRange
+
+### Validation Checks
+
+The checks apply only to user-initiated requests.
+Rancher-initiated requests bypass the validation.
+
+#### On delete
+
+A rancher-managed limit range cannot be deleted by users.
+It can only be deleted by the builtin service account `namespace-controller`.
+
+#### On create and update
+
+A rancher-managed limit range cannot be created or modified by users.
+
+A limit range that is not rancher-managed can't be promoted to rancher-managed.
+
+## Namespace
+
+### Validation Checks
+
+Note: The `kube-system` namespace, unlike other namespaces, has a `failPolicy` of `ignore` on update calls.
+
+#### Project annotation
+Verifies that the annotation `field.cattle.io/projectId` value can only be updated by users with the `manage-namespaces` 
+verb on the project specified in the annotation.
+
+#### PSA Label Validation
+
+Validates that users who create or edit a PSA enforcement label on a namespace have the `updatepsa` verb on `projects` 
+in `management.cattle.io/v3`. See the [upstream docs](https://kubernetes.io/docs/concepts/security/pod-security-admission/) 
+for more information on the effect of these labels.
+
+The following labels are considered relevant for PSA enforcement: 
+- pod-security.kubernetes.io/enforce
+- pod-security.kubernetes.io/enforce-version 
+- pod-security.kubernetes.io/audit 
+- pod-security.kubernetes.io/audit-version 
+- pod-security.kubernetes.io/warn
+- pod-security.kubernetes.io/warn-version
+
+#### Namespace resource limit validation
+
+Validation ensures that the limits for cpu/memory must not be less than the requests for cpu/memory.
+
+#### Protected namespace deletion
+
+On the Rancher management (local) cluster, the `local` and `fleet-local` namespaces may not be deleted, as removing
+them corrupts the Rancher installation.
+
+This check is only registered when the webhook runs with multi-cluster management enabled. On downstream clusters
+namespaces with those names belong to the user and can be deleted normally.
+
+## ResourceQuota
+
+### Validation Checks
+
+The checks apply only to user-initiated requests.
+Rancher-initiated requests bypass the validation.
+
+#### On delete
+
+A rancher-managed resource quota cannot be deleted by users.
+It can be deleted by the `namespace-controller` service account.
+
+#### On create and update
+
+A rancher-managed resource quota cannot be created or modified by users.
+It can be modified by the `resourcequota-controller` service account.
+
+A resource quota that is not rancher-managed can't be promoted to rancher-managed.
+
+## Secret
+
+### Validation Checks
+
+#### On delete
+
+A secret cannot be deleted if its deletion request has an orphan policy,
+and the secret has roles or role bindings dependent on it.
+
+#### On create and update
+
+For Secrets of type `rke.cattle.io/machine-plan`, if `data.plan` is present, its value is parsed using the shared plan schema from `pkg/plan`.
+If the value is not valid JSON or does not conform to the plan schema, the request is rejected.
+
+### Mutation Checks
+
+#### On create
+
+For all secrets of type `provisioning.cattle.io/cloud-credential`, 
+places a `field.cattle.io/creatorId` annotation with the name of the user as the value.
+
+If `field.cattle.io/no-creator-rbac` annotation is set, `field.cattle.io/creatorId` does not get set.
+
+For secrets stored in the `cattle-local-user-passwords` namespace containing local users passwords:
+- Verifies the password has the minimum required length.
+- Verifies the password is not the same as the username.
+- Encrypts the password using pbkdf2.
+
+#### On delete
+
+Checks if there are any RoleBindings owned by this secret which provide access to a role granting access to this secret.
+If yes, the webhook redacts the role, so that it only grants a deletion permission.
+
+# infrastructure.cluster.x-k8s.io/v1beta2
+
+## AWSCluster
+
+### Validation Checks
+
+This webhook validates AWSCluster resources (`infrastructure.cluster.x-k8s.io/v1beta2`).
+
+#### Scope and Operations
+
+- Resource: `infrastructure.cluster.x-k8s.io/v1beta2/awsclusters`
+- Scope: Namespaced
+- Operations: CREATE, UPDATE
+
+#### Credential Access Check
+
+When an `AWSCluster` references an `AWSClusterStaticIdentity` via `spec.identityRef`, the webhook fetches the current state of that identity and checks whether its credential is a Rancher-managed Cloud Credential. If it is, the requesting user must have `get` permission on that credential.
+
+Steps:
+1. If `spec.identityRef` is absent, the request is allowed.
+2. If `spec.identityRef.kind` is not `AWSClusterStaticIdentity`, the request is allowed (other identity types are out of scope).
+3. The referenced `AWSClusterStaticIdentity` is fetched from the cluster. This fetch always occurs on both CREATE and UPDATE, because the identity itself may have changed between requests (different `spec.secretRef`, credential removed).
+   - If not found: request is rejected (400 Bad Request).
+   - If the lookup fails for any other reason: request is rejected (400 Bad Request).
+4. If `AWSClusterStaticIdentity.spec.secretRef` is empty, the request is allowed.
+5. The webhook checks whether a Secret named `spec.secretRef` exists in `cattle-global-data`.
+   - If **no** such secret exists: the identity is considered user-managed and the request is allowed.
+   - If the cache lookup fails with an unexpected error: the request is rejected to fail closed.
+6. If the secret exists in `cattle-global-data`, it is a Rancher Cloud Credential mirrored by Turtles. A SubjectAccessReview is performed: verb `get`, resource `secrets`, namespace `cattle-global-data`, name = `spec.secretRef`.
+   - If denied: request is rejected (403 Forbidden).
+
+#### Rancher Cloud Credentials
+
+Rancher Turtles mirrors user Cloud Credentials (stored in `cattle-global-data`) into the CAPA provider namespace (`capa-system`) for the CAPA controller to consume. The presence of a matching secret in `cattle-global-data` is the signal that a credential is Rancher-managed and subject to access enforcement. User-managed secrets that exist only in `capa-system` are not affected.
+
+## AWSClusterStaticIdentity
+
+### Validation Checks
+
+This webhook validates AWSClusterStaticIdentity resources (`infrastructure.cluster.x-k8s.io/v1beta2`).
+
+#### Scope and Operations
+
+- Resource: `infrastructure.cluster.x-k8s.io/v1beta2/awsclusterstaticidentities`
+- Scope: Cluster
+- Operations: CREATE, UPDATE
+
+#### Credential Access Check
+
+When an `AWSClusterStaticIdentity` references a Secret via `spec.secretRef`, the webhook checks whether that secret is a Rancher-managed Cloud Credential. If it is, the requesting user must have `get` permission on it.
+
+Steps:
+1. If `spec.secretRef` is empty, the request is allowed.
+2. The webhook checks whether a Secret named `spec.secretRef` exists in `cattle-global-data`.
+   - If **no** such secret exists: the identity is considered user-managed and the request is allowed.
+   - If the cache lookup fails with an unexpected error: the request is rejected to fail closed.
+3. If the secret exists in `cattle-global-data`, it is a Rancher Cloud Credential mirrored by Turtles. A SubjectAccessReview is performed on every CREATE and UPDATE (regardless of whether `spec.secretRef` changed): verb `get`, resource `secrets`, namespace `cattle-global-data`, name = `spec.secretRef`.
+   - If denied: request is rejected (403 Forbidden).
+
+#### Rancher Cloud Credentials
+
+Rancher Turtles mirrors user Cloud Credentials (stored in `cattle-global-data`) into the CAPA provider namespace (`capa-system`) for the CAPA controller to consume. The presence of a matching secret in `cattle-global-data` is the signal that a credential is Rancher-managed and subject to access enforcement. User-managed secrets that exist only in `capa-system` are not affected.
+
+# management.cattle.io/v3
+
+## Authconfig
+
+
+### Validation Checks
+
+#### Create and Update
+
+When an LDAP (`openldap`, `freeipa`) or ActiveDirectory (`activedirectory`) authconfig is created or updated, the following checks take place:
+
+- The field `servers` is required.
+- If set, the following fields should have valid LDAP attribute names according to RFC4512
+  - `userSearchAttribute`
+  - `userLoginAttribute`
+  - `userObjectClass`
+  - `userNameAttribute`
+  - `userMemberAttribute` (only for LDAP authconfigs)
+  - `userEnabledAttribute`
+  - `groupSearchAttribute`
+  - `groupObjectClass`
+  - `groupNameAttribute`
+  - `groupDNAttribute`
+  - `groupMemberUserAttribute`
+  - `groupMemberMappingAttribute`
+  - `userIDAttribute`
+  - `groupIDAttribute`
+- If set, the following fields should have a valid LDAP filter expression according to RFC4515
+  - `userLoginFilter`
+  - `userSearchFilter`
+  - `groupSearchFilter`
+
+
+When a SAML authconfig with LDAP search (`shibboleth`, `okta`, `adfs`) is created or updated, the following fields of the embedded `openLdapConfig` should have valid LDAP attribute names according to RFC4512 if set:
+
+- `userIDAttribute`
+- `groupIDAttribute`
+
+These two fields are not immutable for SAML authconfigs. SAML principal IDs come from the assertion, and the LDAP attributes only have to match the values the identity provider sends in the UID and groups fields, which an admin may need to adjust at any time.
+
+#### Update
+
+When an enabled LDAP or ActiveDirectory authconfig is updated and remains enabled, the following fields cannot be changed:
+
+- `userIDAttribute`
+- `groupIDAttribute`
+
+Those providers build principal IDs from the attribute at login, so changing it would orphan every binding that references the old principal names. Disabling the provider with the default cleanup annotation removes its users, tokens, and bindings, so re-enabling with a different identifier attribute is a clean start. With the `user-locked` cleanup annotation, cleanup is skipped and the preserved users and bindings keep principal IDs that no longer resolve after the change.
+
+Only local and one other provider can be enabled without the `multiple-auth-providers` feature in Rancher being enabled.
+
+## Cluster
+
+
+### Mutation Checks
+
+##### Feature: version management on imported RKE2/K3s cluster 
+
+- When a cluster is created or updated, add the `rancher.io/imported-cluster-version-management: system-default` annotation if the annotation is missing or its value is an empty string.
+
+
+### Validation Checks
+
+#### Annotations validation
+
+When a cluster is created and `field.cattle.io/creator-principal-name` annotation is set then `field.cattle.io/creatorId` annotation must be set as well. The value of `field.cattle.io/creator-principal-name` should match the creator's user principal id.
+
+When a cluster is updated `field.cattle.io/creator-principal-name` and `field.cattle.io/creatorId` annotations must stay the same or removed.
+
+If `field.cattle.io/no-creator-rbac` annotation is set, `field.cattle.io/creatorId` cannot be set.
+
+
+##### Feature: version management on imported RKE2/K3s cluster
+
+ - When a cluster is created or updated, the `rancher.io/imported-cluster-version-management` annotation must be set with a valid value (true, false, or system-default). 
+ - If the cluster represents other types of clusters and the annotation is present, the webhook will permit the request with a warning that the annotation is intended for imported RKE2/k3s clusters and will not take effect on this cluster.
+ - If version management is determined to be disabled, and the `.spec.rke2Config` or `.spec.k3sConfig` field exists in the new cluster object with a value different from the old one, the webhook will permit the update with a warning indicating that these changes will not take effect until version management is enabled for the cluster.
+ - If version management is determined to be disabled, and the `.spec.rke2Config` or `.spec.k3sConfig` field is missing, the webhook will permit the request to allow users to remove the unused fields via API or Terraform.
+
+
+##### Feature: Cluster Agent Scheduling Customization
+
+The `SchedulingCustomization` subfield of the `DeploymentCustomization` field defines the properties of a Pod Disruption Budget and Priority Class which will be automatically deployed by Rancher for the cattle-cluster-agent.
+
+The `schedulingCustomization.PriorityClass` field contains two attributes
+
++ `value`: This must be an integer value equal to or between negative 1 billion and 1 billion.
++ `preemptionPolicy`: This must be a string value which indicates the desired preemption behavior, its value can be either `PreemptLowerPriority` or `Never`. Any other value must be rejected.
+
+The `schedulingCustomization.PodDisruptionBudget` field contains two attributes
+
++ `minAvailable`: This is a string value that indicates the minimum number of agent replicas that must be running at a given time.
++ `maxUnavailable`: This is a string value that indicates the maximum number of agent replicas that can be unavailable at a given time.
+
+Both `minAvailable` and `maxUnavailable` must be a string which represents a non-negative whole number, or a whole number percentage greater than or equal to `0%` and less than or equal to `100%`. Only one of the two fields can have a non-zero or empty value at a given time. These fields use the following regex when assessing if a given percentage value is valid:
+```regex
+^([0-9]|[1-9][0-9]|100)%$
+```
+
+##### Feature: Webhook Deployment Customization
+
+The `WebhookDeploymentCustomization` field configures the rancher-webhook deployment on downstream clusters. The following sub-fields are validated:
+
+- `replicaCount`: If set, must be at least 1.
+- `appendTolerations`: Toleration keys are validated against the upstream apimachinery label name regex:
+  ```regex
+  ([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]
+  ```
+- `overrideAffinity`: Node affinity `nodeSelectorTerms` are validated via label name validation. Pod affinity and pod anti-affinity are validated via label selectors using the [apimachinery label selector validation](https://github.com/kubernetes/apimachinery/blob/02a41040d88da08de6765573ae2b1a51f424e1ca/pkg/apis/meta/v1/validation/validation.go#L56).
+- `podDisruptionBudget.minAvailable` and `podDisruptionBudget.maxUnavailable`: Each must be a non-negative whole integer or a whole number percentage between `0%` and `100%`. Only one of the two fields can have a non-zero or non-empty value at a given time. These fields use the following regex when assessing if a given percentage value is valid:
+  ```regex
+  ^([0-9]|[1-9][0-9]|100)%$
+  ```
+- `overrideResourceRequirements`: Not validated by the webhook — the Kubernetes API server validates `ResourceRequirements` natively.
+
+## ClusterProxyConfig
+
+### Validation Checks
+
+#### On create
+
+When creating a clusterproxyconfig, we check to make sure that one does not already exist for the given cluster.
+Only 1 clusterproxyconfig per downstream cluster is ever permitted.
+
+## ClusterRoleTemplateBinding
+
+### Validation Checks
+
+#### Escalation Prevention
+
+Users can only create/update ClusterRoleTemplateBindings which grant permissions to RoleTemplates with rights less than or equal to those they currently possess. This is to prevent privilege escalation.
+`clusterScopedRules` inherited from project RoleTemplates are not granted by ClusterRoleTemplateBindings, so they are neither required nor counted as held.
+For external RoleTemplates (RoleTemplates with `external` set to `true`), if the `external-rules` feature flag is enabled and `ExternalRules` is specified in the roleTemplate in `RoleTemplateName`,
+`ExternalRules` will be used for authorization. Otherwise (if the feature flag is off or `ExternalRules` are nil), the rules from the backing `ClusterRole` in the local cluster will be used.
+
+#### Invalid Fields - Create
+
+Users cannot create ClusterRoleTemplateBindings which violate the following constraints:
+- Either a user subject (through `UserName` or `UserPrincipalName`) or a group subject (through `GroupName` or `GroupPrincipalName`) must be specified; both a user subject and a group subject cannot be specified
+- `ClusterName` must:
+  - Be provided as a non-empty value
+  - Match the namespace of the ClusterRoleTemplateBinding
+  - Refer to an existing cluster
+- The roleTemplate indicated in `RoleTemplateName` must be:
+  - Provided as a non-empty value
+  - Valid (i.e. is an existing `roleTemplate` object of given name in the `management.cattle.io/v3` API group)
+  - Not locked (i.e. `roleTemplate.Locked` must be `false`)
+  - Associated with its appropriate context (`roleTemplate.Context` must be equal to "cluster")
+- If the label indicating ownership by a GlobalRoleBinding (`authz.management.cattle.io/grb-owner`) exists, it must refer to a valid (existing and not deleting) GlobalRoleBinding
+
+#### Invalid Fields - Update
+
+Users cannot update the following fields after creation:
+- RoleTemplateName
+- ClusterName
+- The label indicating ownership by a GlobalRoleBinding (`authz.management.cattle.io/grb-owner`)
+
+Users can update the following fields if they have not been set, but after they have been set they cannot be changed:
+- UserName
+- UserPrincipalName
+- GroupName
+- GroupPrincipalName
+
+In addition, as in the create validation, both a user subject and a group subject cannot be specified.
+
+If the binding is being deleted (has a non-nil `DeletionTimestamp`) and its RoleTemplate can't be found, updates that pass the
+field checks above skip the escalation check. This also applies to a missing inherited RoleTemplate, and to a missing ClusterRole
+for an external RoleTemplate without `externalRules`. This lets finalizers be removed after the RoleTemplate is deleted.
+
+#### Duplicate ClusterRoleTemplateBinding Prevention
+
+On creation, the webhook prevents the creation of a `ClusterRoleTemplateBinding` if another one already exists with the same subject and role in the same cluster. 
+This ensures that a user or group is not granted the same cluster-level role multiple times.
+
+A binding is considered a duplicate if another `ClusterRoleTemplateBinding` exists with the exact same values for:
+- `clusterName`
+- `roleTemplateName`
+- The subject, which is determined by one of the following fields:
+  - `userName`
+  - `userPrincipalName`
+  - `groupName`
+  - `groupPrincipalName`
+
+### Mutations
+
+#### Deterministic Name Generation
+
+On `CREATE`, when `metadata.generateName` is set and `metadata.name` is empty, the mutating webhook replaces the server-side random name generation with a deterministic name derived from the binding's content. The generated name is:
+
+```
+<generateName prefix> + lowercase(base32(sha256(subject + "/" + roleTemplateName + "/" + clusterName))[:10])
+```
+
+The subject is selected using the following priority order:
+1. `userPrincipalName`
+2. `userName`
+3. `groupPrincipalName`
+4. `groupName`
+
+This ensures that two identical concurrent requests produce the same `metadata.name`, causing the Kubernetes API server to reject the second request with a `409 Conflict`. This prevents duplicate `ClusterRoleTemplateBinding` resources from being created by race conditions.
+
+If `metadata.name` is already set (i.e. the caller explicitly chose a name), no mutation is performed.
+
+## Feature
+
+### Validation Checks
+
+#### On update
+
+The desired value must not change on new spec unless it's equal to the `lockedValue` or `lockedValue` is nil.
+Due to the security impact of the `external-rules` feature flag, only users with admin permissions (`*` verbs on `*` resources in `*` APIGroups in all namespaces) can enable or disable this feature flag.
+
+## FleetWorkspace
+
+### Validation Checks
+
+A `FleetWorkspace` cannot be created if a namespace with the same name already exists.
+
+### Mutation Checks
+
+The `FleetWorkspace` mutating webhook no longer creates resources on create.
+Namespace and RBAC objects are reconciled by the Rancher controller after
+workspace creation.
+
+## GlobalRole
+
+### Validation Checks
+
+Note: all checks are bypassed if the GlobalRole is being deleted, or if only the metadata fields are being updated.
+
+#### Invalid Fields - Create and Update
+
+On create or update, the following checks take place:
+- The webhook validates each rule using the standard Kubernetes RBAC checks (see next section).
+- Each new RoleTemplate referred to in `inheritedClusterRoles` must have a context of `cluster` and not be `locked`. This validation is skipped for RoleTemplates in `inheritedClusterRoles` for the prior version of this object.
+
+#### Rules Without Verbs, Resources, API groups
+
+Rules without verbs, resources, or apigroups are not permitted. The `rules` included in a GlobalRole are of the same type as the rules used by standard Kubernetes RBAC types (such as `Roles` from `rbac.authorization.k8s.io/v1`). Because of this, they inherit the same restrictions as these types, including this one.
+
+#### Escalation Prevention
+
+ Escalation checks are bypassed if a user has the `escalate` verb on the GlobalRole that they are attempting to update or create. This can also be given through a wildcard permission (i.e. the `*` verb also gives `escalate`).
+
+Users can only change GlobalRoles with rights less than or equal to those they currently possess. This is to prevent privilege escalation. This includes the rules in the RoleTemplates referred to in `inheritedClusterRoles` (excluding inherited `clusterScopedRules`, which are not granted on downstream clusters), the rules in `inheritedFleetWorkspacePermissions`, and the rules in `inheritedNamespacedRules`.
+
+Users can only grant rules in the `NamespacedRules` field with rights less than or equal to those they currently possess. This works on a per namespace basis, meaning that the user must have the permission
+in the namespace specified. The `Rules` field apply to every namespace, which means a user can create `NamespacedRules` in any namespace that are equal to or less than the `Rules` they currently possess.
+
+#### Builtin Validation
+
+The `globalroles.builtin` field is immutable, and new builtIn GlobalRoles cannot be created.
+If `globalroles.builtin` is true then all fields are immutable except  `metadata` and `newUserDefault`.
+If `globalroles.builtin` is true then the GlobalRole can not be deleted.
+
+## GlobalRoleBinding
+
+### Validation Checks
+
+Note: all checks are bypassed if the GlobalRoleBinding is being deleted, or if only the metadata fields are being updated.
+
+#### Escalation Prevention
+
+Users can only create/update GlobalRoleBindings with rights less than or equal to those they currently possess. This is to prevent privilege escalation. 
+
+#### Valid Global Role Reference
+
+GlobalRoleBindings must refer to a valid global role (i.e. an existing `GlobalRole` object in the `management.cattle.io/v3` apiGroup).
+
+This escalation check is bypassed if a user has the `bind` verb on the GlobalRole that they are trying to bind to (through creating or updating a GlobalRoleBinding to that GlobalRole). This can also be given through a wildcard permission (i.e. the `*` verb also gives `bind`).
+
+#### Invalid Fields - Update
+Users cannot update the following fields after creation:
+- `userName`
+- `userPrincipalName`
+- `groupPrincipalName`
+- `globalRoleName`
+
+
+#### Invalid Fields - Create
+GlobalRoleBindings must have one of `userName`, `userPrincipalName` or `groupPrincipalName` but not all.
+All RoleTemplates which are referred to in the `inheritedClusterRoles` field must exist and not be locked. 
+
+### Mutation Checks
+
+#### On create
+
+When a GlobalRoleBinding is created an owner reference is created on the binding referring to the backing GlobalRole defined by `globalRoleName`.
+
+## NodeDriver
+
+### Validation Checks
+
+Note: checks only run if a node driver is being disabled or deleted
+
+#### Machine Deletion Prevention
+
+This admission webhook prevents the disabling or deletion of a NodeDriver if there are any Nodes that are under management by said driver. If there are _any_ nodes that use the driver the request will be denied.
+
+## Project
+
+### Validation Checks
+
+#### ClusterName validation
+
+ClusterName must be equal to the namespace, and must refer to an existing `management.cattle.io/v3.Cluster` object. In addition, users cannot update the field after creation.
+
+#### BackingNamespace validation
+The BackingNamespace field cannot be changed once set. Projects without the BackingNamespace field can have it added.
+
+#### Protects system project
+
+The system project cannot be deleted.
+
+#### Quota validation
+
+Project quotas and default limits must be consistent with one another and must be sufficient for the requirements of active namespaces.
+
+#### Container default resource limit validation
+
+Validation mimics the upstream behavior of the Kubernetes API server when it validates LimitRanges.
+The container default resource configuration must have properly formatted quantities for all requests and limits.
+
+Limits for any resource must not be less than requests.
+
+#### Annotations validation
+
+When a project is created and `field.cattle.io/creator-principal-name` annotation is set then `field.cattle.io/creatorId` annotation must be set as well. The value of `field.cattle.io/creator-principal-name` should match the creator's user principal id.
+
+When a project is updated `field.cattle.io/creator-principal-name` and `field.cattle.io/creatorId` annotations must stay the same or removed.
+
+If `field.cattle.io/no-creator-rbac` annotation is set, `field.cattle.io/creatorId` cannot be set.
+
+### Mutations
+
+#### On create
+
+Populates the BackingNamespace field by concatenating `Project.ClusterName` and `Project.Name`.
+
+If the project is using a generated name (ie `GenerateName` is not empty), the generation happens within the mutating webhook.
+The reason for this is that the BackingNamespace is made up of the `Project.Name`, and name generation happens after mutating webhooks and before validating webhooks.
+
+Adds the authz.management.cattle.io/creator-role-bindings annotation.
+
+#### On update
+
+If the BackingNamespace field is empty, populate the BackingNamespace field with the project name.
+
+## ProjectRoleTemplateBinding
+
+### Validation Checks
+
+#### Escalation Prevention
+
+Users can only create/update ProjectRoleTemplateBindings with rights less than or equal to those they currently possess.
+This is to prevent privilege escalation.
+If the RoleTemplate has `clusterScopedRules` (including those inherited through project-context RoleTemplates; inheritance through a cluster-context RoleTemplate does not grant them), the user must hold those rights cluster-wide, through ClusterRoleBindings, ClusterRoleTemplateBindings for the cluster, or the `clusterScopedRules` of their existing ProjectRoleTemplateBindings in the cluster. Project-level permissions (including the project-scoped rules of existing ProjectRoleTemplateBindings) and RoleBindings in the cluster namespace are not sufficient.
+For external RoleTemplates (RoleTemplates with `external` set to `true`), if the `external-rules` feature flag is enabled and `ExternalRules` is specified in the roleTemplate in `RoleTemplateName`,
+`ExternalRules` will be used for authorization. Otherwise, if `ExternalRules` are nil when the feature flag is on, the rules from the backing `ClusterRole` in the local cluster will be used.
+
+#### Invalid Fields - Create
+
+Users cannot create ProjectRoleTemplateBindings that violate the following constraints:
+
+- The `ProjectName` field must be:
+    - Provided as a non-empty value
+    - Specified using the format of `clusterName:projectName`; `clusterName` is the `metadata.name` of a cluster, and `projectName` is the `metadata.name` of a project
+    - Refer to a valid project and cluster (both must exist and project.Spec.ClusterName must equal the cluster)
+- Either a user subject (through `UserName` or `UserPrincipalName`), or a group subject (through `GroupName`
+  or `GroupPrincipalName`), or a service account subject (through `ServiceAccount`) must be specified. Exactly one
+  subject type of the three must be provided.
+- The roleTemplate indicated in `RoleTemplateName` must be:
+    - Provided as a non-empty value
+    - Valid (there must exist a `roleTemplate` object of given name in the `management.cattle.io/v3` API group)
+    - Not locked (`roleTemplate.Locked` must be `false`)
+    - Associated with its appropriate context (`roleTemplate.Context` must be equal to "project")
+
+#### Invalid Fields - Update
+
+Users cannot update the following fields after creation:
+
+- RoleTemplateName
+- ProjectName
+- ServiceAccount
+
+Users can update the following fields if they had not been set. But after getting initial values, the fields cannot be
+changed:
+
+- UserName
+- UserPrincipalName
+- GroupName
+- GroupPrincipalName
+
+In addition, as in the create validation, both a user subject and a group subject cannot be specified.
+
+If the binding is being deleted (has a non-nil `DeletionTimestamp`) and its RoleTemplate can't be found, updates that pass the
+field checks above skip the escalation check. This also applies to a missing inherited RoleTemplate, and to a missing ClusterRole
+for an external RoleTemplate without `externalRules`. This lets finalizers be removed after the RoleTemplate is deleted.
+
+#### Duplicate ProjectRoleTemplateBinding Prevention
+
+On creation, the webhook prevents the creation of a `ProjectRoleTemplateBinding` if another one already exists with the same subject and role in the same project.
+This ensures that a user or group is not granted the same project-level role multiple times.
+
+A binding is considered a duplicate if another non-deleting `ProjectRoleTemplateBinding` exists in the same namespace with the exact same values for:
+- `roleTemplateName`
+- The subject, which is determined by one of the following fields:
+  - `userName`
+  - `userPrincipalName`
+  - `groupName`
+  - `groupPrincipalName`
+
+If a conflicting binding exists but is already marked for deletion (has a non-nil `DeletionTimestamp`), it is ignored, allowing the creation to proceed.
+
+### Mutation Checks
+
+#### On create
+
+When a `ProjectRoleTemplateBinding` is created using the `generateName` pattern (i.e. `metadata.name` is empty), the webhook replaces the server-generated random name with a deterministic `metadata.name` based on a hash of the binding's content.
+
+When the client sets an explicit `metadata.name`, the mutator does nothing. This preserves backward compatibility for public API consumers and customer automations that depend on specific resource names. The validating webhook's [duplicate check](#duplicate-projectroletemplatebinding-prevention) provides additional protection against duplicate bindings created with different explicit names.
+
+The deterministic name is computed as:
+
+```
+prefix + lowercase(base32(sha256(subject + "/" + roleTemplateName + "/" + projectName))[:10])
+```
+
+The prefix is taken from `metadata.generateName` if set, otherwise defaults to `prtb-`.
+
+The subject is resolved using the following priority order:
+1. `UserPrincipalName`
+2. `UserName`
+3. `GroupPrincipalName`
+4. `GroupName`
+5. `ServiceAccount`
+
+If no subject is set, the mutator passes the request through without modification (the validating webhook will reject it).
+
+This ensures that two identical concurrent requests using `generateName` produce the same resource name. The Kubernetes API server will reject the second request with a `409 Conflict`, preventing duplicate bindings even when requests race past the validating webhook.
+
+## ProxyEndpoint
+
+### Validation Checks
+
+#### Overly Broad Wildcard Check
+
+Users may only create route entries within a ProxyEndpoint CR which
+
++ Are Absolute domains (`www.myapi.com`)
++ Are partial, inline, wildcards (`www.%.myapi.com`)
++ Are prefix wildcards (`*.myapi.com`, `*myapi.com`)
++ Do not include protocols (`https://`, etc.)
+
+Some of these checks are also done before a request is sent to the webhook, using kubebuilder Pattern comments on the CRD itself. Others, such as the overly broad wildcard check (e.g. `%.com`, `subdomain.%.com`), are done in the webhook as a regular expression would not be sufficient. In the event that the webhook is not running, the Rancher proxy also verifies that the route is not overly broad and silently ignores it if it is.  
+
+## RoleTemplate
+
+### Validation Checks
+
+Note: all checks are bypassed if the RoleTemplate is being deleted
+
+####  Circular Reference
+
+Circular references to a `RoleTemplate` (a inherits b, b inherits a) are not allowed. More specifically, if "roleTemplate1" is included in the `roleTemplateNames` of "roleTemplate2", then "roleTemplate2" must not be included in the `roleTemplateNames` of "roleTemplate1". This check prevents the creation of roles whose end-state cannot be resolved.
+
+#### Rules Without Verbs, Resources, API groups
+
+Rules without verbs, resources, or apigroups are not permitted. The `rules`, `clusterScopedRules`, and `externalRules` included in a RoleTemplate are of the same type as the rules used by standard Kubernetes RBAC types (such as `Roles` from `rbac.authorization.k8s.io/v1`). Because of this, they inherit the same restrictions as these types, including this one.
+
+#### Escalation Prevention
+
+Users can only change RoleTemplates with rights less than or equal to those they currently possess. This prevents privilege escalation. 
+This applies to both `rules` and `clusterScopedRules`, including those inherited from other RoleTemplates. Only `clusterScopedRules` inherited through project-context RoleTemplates are considered, since inheritance through a cluster-context RoleTemplate does not grant them.
+Users can't create external RoleTemplates (or update existing RoleTemplates) with `ExternalRules` without having the `escalate` verb on that RoleTemplate.
+
+#### Context Validation
+
+The `roletemplates.context` field must be one of the following values [`"cluster"`, `"project"`, `""`].
+If the `roletemplates.administrative` is set to true the context must equal `"cluster"`.
+
+If the `roletemplate.ProjectCreatorDefault` is true, context must equal `"project"`
+If there are `clusterScopedRules`, context must equal `"project"`
+
+#### Builtin Validation
+
+The `roletemplates.builtin` field is immutable, and new builtIn RoleTemplates cannot be created.
+
+If `roletemplates.builtin` is true then all fields are immutable except:
+- `metadata` 
+- `clusterCreatorDefault` 
+- `projectCreatorDefault`
+- `locked`
+
+ ### Deletion check
+
+RoleTemplate can not be deleted if they are referenced by other RoleTemplates via `roletemplates.roleTemplateNames` or by GlobalRoles via `globalRoles.inheritedClusterRoles`
+
+## Setting
+
+### Validation Checks
+
+#### Create and Update
+
+When settings are created or updated, the following common checks take place:
+
+- If set, `disable-inactive-user-after` must be zero or a positive duration (e.g. `240h`).
+- If set, `delete-inactive-user-after` must be zero or a positive duration and can't be less than `336h` (e.g. `336h`).
+- If set, `user-last-login-default` must be a date time according to RFC3339 (e.g. `2023-11-29T00:00:00Z`).
+- If set, `user-retention-cron` must be a valid standard cron expression (e.g. `0 0 * * 0`).
+- The `auth-user-session-ttl-minutes` must be a positive integer and can't be greater than `disable-inactive-user-after` or `delete-inactive-user-after` if those values are set.
+- The `auth-user-session-idle-ttl-minutes` must be a positive integer and can't be greater than `auth-user-session-ttl-minutes`.
+- The `auth-user-info-max-age-seconds` must be a valid duration value.
+- The `auth-user-info-resync-cron` must be a valid cron expression.
+- If set, `crt-default-ttl-minutes` must be a valid integer no less than `30` and greater than `crt-default-grace-period-minutes` if that value is set.
+- If set, `crt-default-grace-period-minutes` must be a valid integer no less than `10` and less than `crt-default-ttl-minutes` if that value is set.
+
+#### Update
+
+When settings are updated, the following additional checks take place:
+
+- Settings with a source of `env` may not be updated, unless they are being reset to their default (both `source` and
+  `value` are cleared), which Rancher does when the env var that configured the setting is removed.
+
+- Read only settings like `cacerts` must not be updated.
+
+- The new value for the setting must not be ""
+
+- If `agent-tls-mode` has `default` or `value` updated from `system-store` to `strict`, then all non-local clusters must
+  have a status condition `AgentTlsStrictCheck` set to `True`, unless the new setting has an overriding
+  annotation `cattle.io/force=true`.
+
+
+- `cluster-agent-default-priority-class` and `fleet-agent-default-priority-class` must contain a valid JSON object which matches the format of a `v1.PriorityClassSpec` object. The Value field must be greater than or equal to negative 1 billion and less than or equal to 1 billion. The Preemption field must be a string value set to either `PreemptLowerPriority` or `Never`.
+
+
+- `cluster-agent-default-pod-disruption-budget` and `fleet-agent-default-pod-disruption-budget` must contain a valid JSON object which matches the format of a `v1.PodDisruptionBudgetSpec` object. The `minAvailable` and `maxUnavailable` fields must have a string value that is either a non-negative whole number, or a non-negative whole number percentage value less than or equal to `100%`.
+
+## Token
+
+### Validation Checks
+
+#### Invalid Fields - Create
+
+When a Token is created, the following checks take place:
+
+- If set, `lastUsedAt` must be a valid date time according to RFC3339 (e.g. `2023-11-29T00:00:00Z`).
+
+#### Invalid Fields - Update
+
+When a Token is updated, the following checks take place:
+
+- If set, `lastUsedAt` must be a valid date time according to RFC3339 (e.g. `2023-11-29T00:00:00Z`).
+
+## User
+
+### Validation Checks
+
+#### Create
+
+Verifies there aren't any other users with the same username.
+
+Verifies that a new user is not linked to the `local` auth provider when the feature `hide-local-auth-provider` is set to `true`, and an external auth provider is active.
+
+#### Update and Delete
+
+When a user is updated or deleted, a check occurs to ensure that the user making the request has permissions greater than or equal to the user being updated or deleted. To get the user's groups, the user's UserAttributes are checked. This is best effort, because UserAttributes are only updated when a User logs in, so it may not be perfectly up to date.
+
+If the user making the request has the verb `manage-users` for the resource `users`, then it is allowed to bypass the check. Note that the wildcard `*` includes the `manage-users` verb.
+
+Verifies that the modified or deleted user is not linked to the `local` auth provider when the feature `hide-local-auth-provider` is set to `true`, and an external auth provider is active.
+
+#### Invalid Fields - Update
+
+Users can update the following fields if they had not been set. But after getting initial values, the fields cannot be changed:
+
+- `userName`
+
+The following fields are immutable:
+
+- `principalIDs` (managed internally by Rancher).
+
+A user can't deactivate or delete himself.
+
+## UserAttribute
+
+### Validation Checks
+
+#### Invalid Fields - Create
+
+When a UserAttribute is created, the following checks take place:
+
+- If set, `lastLogin` must be a valid date time according to RFC3339 (e.g. `2023-11-29T00:00:00Z`).
+- If set, `disableAfter` must be zero or a positive duration (e.g. `240h`).
+- If set, `deleteAfter` must be zero or a positive duration (e.g. `240h`).
+
+#### Invalid Fields - Update
+
+When a UserAttribute is updated, the following checks take place:
+
+- If set, `lastLogin` must be a valid date time according to RFC3339 (e.g. `2023-11-29T00:00:00Z`).
+- If set, `disableAfter` must be zero or a positive duration (e.g. `240h`).
+- If set, `deleteAfter` must be zero or a positive duration (e.g. `240h`).
+
+# provisioning.cattle.io/v1
+
+## Cluster
+
+### Validation Checks
+
+#### On Create
+
+##### Creator ID Annotation
+
+The annotation `field.cattle.io/creatorId` must be set to the Username of the User that initiated the request.
+
+If `field.cattle.io/no-creator-rbac` annotation is set, `field.cattle.io/creatorId` cannot be set.
+
+##### Management Cluster Name Annotation
+
+The annotation `provisioning.cattle.io/management-cluster-name` sets the name of the management cluster that Rancher creates.
+Rancher ignores an empty value. The webhook accepts an empty value and skips the checks in this section.
+
+If the annotation has a value, all of these conditions must be true:
+- The value has the format `c-m-<8 characters>`. Each of the 8 characters is a lowercase letter or a digit.
+- No other provisioning cluster sets the same value in this annotation or in `status.clusterName`.
+- No management cluster has this name.
+
+If a management cluster has this name, the webhook accepts the request only when both of these conditions are true:
+- The annotations `objectset.rio.cattle.io/owner-gvk`, `objectset.rio.cattle.io/owner-namespace` and `objectset.rio.cattle.io/owner-name` of the management cluster point to the provisioning cluster in the request.
+- The management cluster is not being deleted.
+
+This exception allows a restore from a backup, because the restore creates the management cluster before the provisioning cluster.
+
+##### NO_PROXY value
+
+Prevent the creation of new objects with an env var (under `spec.agentEnvVars`) with a name of `NO_PROXY` if its value contains one or more spaces. This ensures that the provided value adheres to
+the format expected by Go, and helps to prevent subtle issues elsewhere when writing scripts which utilize `NO_PROXY`.  
+
+##### Data Directories
+
+Prevent the creation of new objects with an env var (under `spec.agentEnvVars`) with a name of `CATTLE_AGENT_VAR_DIR`.
+Prevent the creation of new objects with an invalid data directory. An invalid data directory is defined as the 
+following:
+- Is not an absolute path (i.e. does not start with `/`)
+- Attempts to include environment variables (e.g. `$VARIABLE` or `${VARIABLE}`)
+- Attempts to include shell expressions (e.g. `$(command)` or `` `command` ``)
+- Equal to another data directory
+- Attempts to nest another data directory
+
+If the action is an update, and the old cluster had a `nil` `.spec.rkeConfig`, accept the request, since this is how rancherd operates, and is required for harvester installations.
+
+##### Etcd S3 CloudCredential Secret
+
+Prevent the creation of objects if the secret specified in `.spec.rkeConfig.etcd.s3.cloudCredentialName` does not exist.
+
+##### Machine Selector Files
+
+Prevent the creation of objects if the requesting user does not have `get` permission on each Secret or ConfigMap
+referenced by `spec.rkeConfig.machineSelectorFiles` in the cluster's namespace. These checks also apply to
+server-side dry-run requests.
+
+Access check results are cached for up to 10 seconds per user identity and source.
+
+The generated Pod Security Admission Configuration Template (PSACT) file entry is exempt when
+`spec.defaultPodSecurityAdmissionConfigurationTemplateName` is set and the entire entry matches the generated
+entry for this cluster, ignoring only hashes. A matching Secret name alone does not qualify.
+
+##### Pod Security Admission Configuration Template
+
+When `spec.defaultPodSecurityAdmissionConfigurationTemplateName` is set, the referenced
+`PodSecurityAdmissionConfigurationTemplate` must exist and the cluster's Kubernetes version must be 1.23 or above.
+The admission-configuration secret managed by the mutator, and the cluster fields derived from it, are also
+validated — except on server-side dry-run requests, where the mutator does not perform that secret management (see
+Mutation Checks); the template-existence and version checks still run on dry-run. The same applies on update, and
+the check that the secret was removed is skipped on dry-run deletes.
+
+#### On Update
+
+##### Creator ID Annotation
+
+The annotation `field.cattle.io/creatorId` cannot be changed, but it can be removed.
+
+If `field.cattle.io/no-creator-rbac` annotation is set, `field.cattle.io/creatorId` cannot be set.
+
+##### Management Cluster Name Annotation
+
+The annotation `provisioning.cattle.io/management-cluster-name` cannot be added, changed or removed.
+
+##### RKEConfig changed
+
+The `spec.rkeConfig` field cannot be changed from `nil`/ not `nil` after creation.
+
+The local cluster is an exemption, as the rancherd use case allows managing the local cluster via this mechanism.
+
+##### Machine Selector Files
+
+The same access checks and PSACT exemption as on create apply to new or changed
+`spec.rkeConfig.machineSelectorFiles` entries. Entries are compared in full, including `machineLabelSelector` and
+item hashes, regardless of their position in the list.
+
+When the cluster's labels change, the same access checks also apply to unchanged entries whose source has the
+`rke.cattle.io/object-authorized-for-clusters-selector` annotation, including an empty value. This applies to any
+cluster label change. Missing unchanged sources are skipped for this additional check; other source lookup
+errors reject the request. New or changed entries still require access checks even when a source is missing.
+
+##### Data Directories
+
+On update, prevent new env vars with this name from being added but allow them to be removed. Rancher will perform 
+a one-time migration to move the system-agent data dir definition to the top level field from the `AgentEnvVars` 
+section. A secondary validator will ensure that the effective data directory for the `system-agent` is not different 
+from the one chosen during cluster creation. Additionally, the changing of a data directory for the `system-agent`, 
+kubernetes distro (RKE2/K3s), and CAPR components is also prohibited.
+
+##### cluster.spec.clusterAgentDeploymentCustomization and cluster.spec.fleetAgentDeploymentCustomization
+
+The `DeploymentCustomization` fields are of 3 types:
+- `appendTolerations`: adds tolerations to the appropriate deployment (cluster-agent/fleet-agent)
+- `affinity`: adds various affinities to the deployments, which include the following
+  - `nodeAffinity`: where to schedule the workload
+  - `podAffinitity` and `podAntiAffinity`: pods to avoid or prefer when scheduling the workload
+
+A `Toleration` is matched to a regex which is provided by upstream [apimachinery here](https://github.com/kubernetes/apimachinery/blob/02a41040d88da08de6765573ae2b1a51f424e1ca/pkg/apis/meta/v1/validation/validation.go#L96) but it boils down to this regex on the label:
+```regex
+([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]
+```
+
+For the `Affinity` based rules, the `podAffinity`/`podAntiAffinity` are validated via label selectors via [this apimachinery function](https://github.com/kubernetes/apimachinery/blob/02a41040d88da08de6765573ae2b1a51f424e1ca/pkg/apis/meta/v1/validation/validation.go#L56) whereas the `nodeAffinity` `nodeSelectorTerms` are validated via the same `Toleration` function.
+
+##### cluster.spec.clusterAgentDeploymentCustomization.schedulingCustomization and cluster.spec.fleetAgentDeploymentCustomization.schedulingCustomization
+
+The `SchedulingCustomization` subfield of the `DeploymentCustomization` field defines the properties of a Pod Disruption Budget and Priority Class which will be automatically deployed by Rancher for the cattle-cluster-agent.
+
+The `schedulingCustomization.PriorityClass` field contains two attributes
+
++ `value`: This must be an integer value equal to or between negative 1 billion and 1 billion.
++ `preemptionPolicy`: This must be a string value which indicates the desired preemption behavior, its value can be either `PreemptLowerPriority` or `Never`. Any other value must be rejected.
+
+The `schedulingCustomization.PodDisruptionBudget` field contains two attributes
+
++ `minAvailable`: This is a string value that indicates the minimum number of agent replicas that must be running at a given time.
++ `maxUnavailable`: This is a string value that indicates the maximum number of agent replicas that can be unavailable at a given time.
+
+Both `minAvailable` and `maxUnavailable` must be a string which represents a non-negative whole number, or a whole number percentage greater than or equal to `0%` and less than or equal to `100%`. Only one of the two fields can have a non-zero or empty value at a given time. These fields use the following regex when assessing if a given percentage value is valid:
+```regex
+^([0-9]|[1-9][0-9]|100)%$
+```
+
+##### cluster.spec.webhookDeploymentCustomization
+
+The `WebhookDeploymentCustomization` field configures the rancher-webhook deployment on downstream clusters. The following sub-fields are validated:
+
+- `replicaCount`: If set, must be at least 1.
+- `appendTolerations`: Toleration keys are validated against the same upstream apimachinery label name regex used for agent deployment customizations:
+  ```regex
+  ([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]
+  ```
+- `overrideAffinity`: Node affinity `nodeSelectorTerms` are validated via label name validation. Pod affinity and pod anti-affinity are validated via label selectors using the [apimachinery label selector validation](https://github.com/kubernetes/apimachinery/blob/02a41040d88da08de6765573ae2b1a51f424e1ca/pkg/apis/meta/v1/validation/validation.go#L56).
+- `podDisruptionBudget.minAvailable` and `podDisruptionBudget.maxUnavailable`: Each must be a non-negative whole integer or a whole number percentage between `0%` and `100%`. Only one of the two fields can have a non-zero or non-empty value at a given time. These fields use the following regex when assessing if a given percentage value is valid:
+  ```regex
+  ^([0-9]|[1-9][0-9]|100)%$
+  ```
+- `overrideResourceRequirements`: Not validated by the webhook — the Kubernetes API server validates `ResourceRequirements` natively.
+
+##### NO_PROXY value
+
+Prevent the update of objects with an env var (under `spec.agentEnvVars`) with a name of `NO_PROXY` if its value contains one or more spaces. This ensures that the provided value adheres to
+the format expected by Go, and helps to prevent subtle issues elsewhere when writing scripts which utilize `NO_PROXY`.  
+
+The only exception to this check is if the existing cluster already has a `NO_PROXY` variable which includes spaces in its value. In this case, update operations are permitted. If `NO_PROXY` is later updated to value which does not contain spaces, this exception will no longer occur.
+
+##### Etcd S3 CloudCredential Secret
+
+Prevent the update of objects if the secret specified in `.spec.rkeConfig.etcd.s3.cloudCredentialName` does not exist.
+
+##### ETCD Snapshot Restore
+
+Validation for `spec.rkeConfig.etcdSnapshotRestore` is only triggered when this field is changed to a new, non-empty value. This check is intentionally skipped if the field is unchanged, which prevents blocking unrelated cluster updates (e.g., node scaling) if the referenced snapshot is deleted *after* a successful restore.
+
+When triggered, the following checks are performed:
+
+* The referenced snapshot in `etcdSnapshotRestore.name` must exist in the same namespace as the cluster.
+* The `etcdSnapshotRestore.restoreRKEConfig` field must be a supported mode (`"none"`, `"kubernetesVersion"`, or `"all"`).
+* If `restoreRKEConfig` is **`"kubernetesVersion"`**, the snapshot's metadata must be parsable and contain a `kubernetesVersion`.
+* If `restoreRKEConfig` is **`"all"`**, the snapshot's metadata must be parsable and contain both `kubernetesVersion` and `rkeConfig`.
+
+### Mutation Checks
+
+#### On Create
+
+##### Creator ID Annotation
+
+When a cluster is created `field.cattle.io/creatorId` is set to the Username from the request.
+
+If `field.cattle.io/no-creator-rbac` annotation is set, `field.cattle.io/creatorId` does not get set.
+
+This also applies to server-side dry-run creates: the annotation is set in the returned patch, so the Creator ID
+validation passes on a dry-run exactly as it does on a real create.
+
+##### Pod Security Admission Configuration Template
+
+When a cluster is created or updated with `spec.defaultPodSecurityAdmissionConfigurationTemplateName` set, the
+mutator manages an admission-configuration secret for the cluster and sets the machine selector file and
+kube-apiserver argument that mount it; when the field is cleared, the secret is deleted and those fields are
+dropped. On server-side dry-run requests the secret is neither written nor deleted, and the derived fields are not
+set or dropped — the corresponding validation of that state is skipped on dry-run as well (see Validation Checks).
+
+#### On Update
+
+##### Dynamic Schema Drop
+
+Check for the presence of the `provisioning.cattle.io/allow-dynamic-schema-drop` annotation. If the value is `"true"`,
+perform no mutations. If the value is not present or not `"true"`, compare the value of the `dynamicSchemaSpec` field
+for each `machinePool`, to its' previous value. If the values are not identical, revert the value for the
+`dynamicSchemaSpec` for the specific `machinePool`, but do not reject the request.
+
+The revert also applies to server-side dry-run updates, so a dry-run preview matches what a real update would
+persist.
+
+# rbac.authorization.k8s.io/v1
+
+## ClusterRole
+
+### Validation Checks
+
+#### Invalid Fields - Update
+
+Users cannot update or remove the following labels after they have been added:
+
+  - authz.management.cattle.io/gr-owner
+  - authz.cluster.cattle.io/clusterrole-owner-install-uuid
+
+## ClusterRoleBinding
+
+### Validation Checks
+
+#### Invalid Fields - Update
+Users cannot update or remove the following label after it has been added:
+- authz.management.cattle.io/grb-owner
+
+## Role
+
+### Validation Checks
+
+#### Invalid Fields - Update
+Users cannot update or remove the following label after it has been added:
+- authz.management.cattle.io/gr-owner
+
+## RoleBinding
+
+### Validation Checks
+
+#### Invalid Fields - Update
+Users cannot update or remove the following label after it has been added:
+- authz.management.cattle.io/grb-owner
+
+# rke-machine-config.cattle.io/v1
+
+## MachineConfig
+
+### Validation Checks
+
+#### Creator ID Annotation
+
+The annotation `field.cattle.io/creatorId` must be set to the Username of the User that initiated the request.
+
+The annotation `field.cattle.io/creatorId` cannot be changed, but it can be removed.
+
+If `field.cattle.io/no-creator-rbac` annotation is set, `field.cattle.io/creatorId` cannot be set.
+
+### Mutation Checks
+
+#### Creator ID Annotion
+
+When a cluster is created `field.cattle.io/creatorId` is set to the Username from the request.
+
+If `field.cattle.io/no-creator-rbac` annotation is set, `field.cattle.io/creatorId` does not get set.
+
+# rke.cattle.io/v1
+
+## RKEControlPlane
+
+### Validation Checks
+
+#### On Create
+
+##### Data Directories
+
+Prevent the creation of new objects with an invalid data directory. An invalid data directory is defined as the
+following:
+- Is not an absolute path (i.e. does not start with `/`)
+- Attempts to include environment variables (e.g. `$VARIABLE` or `${VARIABLE}`)
+- Attempts to include shell expressions (e.g. `$(command)` or `` `command` ``)
+- Is not clean (e.g. contains `.` or `..`)
+- Equal to another data directory
+- Attempts to nest another data directory
+
+#### On Update
+
+##### Data Directories
+
+Prevent updating objects with an invalid data directory. An invalid data directory is defined as the
+following:
+- Is not an absolute path (i.e. does not start with `/`)
+- Attempts to include environment variables (e.g. `$VARIABLE` or `${VARIABLE}`)
+- Attempts to include shell expressions (e.g. `$(command)` or `` `command` ``)
+- Is not clean (e.g. contains `.` or `..`)
+- Equal to another data directory
+- Attempts to nest another data directory

@@ -13,7 +13,7 @@ import (
 	v1 "github.com/rancher/rancher/pkg/apis/provisioning.cattle.io/v1"
 	rkev1 "github.com/rancher/rancher/pkg/apis/rke.cattle.io/v1"
 	v3 "github.com/rancher/rancher/pkg/generated/controllers/management.cattle.io/v3"
-	objectsv1 "github.com/rancher/rancher/pkg/webhook/generated/objects/provisioning.cattle.io/v1"
+	objectsv1 "github.com/rancher/rancher/pkg/generated/objects/provisioning.cattle.io/v1"
 	psa "github.com/rancher/rancher/pkg/webhook/podsecurityadmission"
 	"github.com/rancher/rancher/pkg/webhook/resources/common"
 	"github.com/rancher/webhook/pkg/admission"

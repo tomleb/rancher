@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"slices"
 
-	objectsv1 "github.com/rancher/rancher/pkg/webhook/generated/objects/core/v1"
+	objectsv1 "github.com/rancher/rancher/pkg/generated/objects/core/v1"
 	"github.com/rancher/webhook/pkg/admission"
 	"github.com/sirupsen/logrus"
 	admissionv1 "k8s.io/api/admission/v1"

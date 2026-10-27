@@ -7,8 +7,8 @@ import (
 	"strings"
 
 	v3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
+	objectsv3 "github.com/rancher/rancher/pkg/generated/objects/management.cattle.io/v3"
 	"github.com/rancher/rancher/pkg/webhook/auth"
-	objectsv3 "github.com/rancher/rancher/pkg/webhook/generated/objects/management.cattle.io/v3"
 	"github.com/rancher/rancher/pkg/webhook/resolvers"
 	"github.com/rancher/rancher/pkg/webhook/resources/common"
 	"github.com/rancher/webhook/pkg/admission"

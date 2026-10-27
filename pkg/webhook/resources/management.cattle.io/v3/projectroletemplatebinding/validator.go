@@ -8,8 +8,8 @@ import (
 
 	apisv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	v3 "github.com/rancher/rancher/pkg/generated/controllers/management.cattle.io/v3"
+	objectsv3 "github.com/rancher/rancher/pkg/generated/objects/management.cattle.io/v3"
 	"github.com/rancher/rancher/pkg/webhook/auth"
-	objectsv3 "github.com/rancher/rancher/pkg/webhook/generated/objects/management.cattle.io/v3"
 	"github.com/rancher/rancher/pkg/webhook/resolvers"
 	"github.com/rancher/webhook/pkg/admission"
 	admissionv1 "k8s.io/api/admission/v1"

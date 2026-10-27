@@ -3,7 +3,7 @@ package rolebinding
 import (
 	"fmt"
 
-	objectsv1 "github.com/rancher/rancher/pkg/webhook/generated/objects/rbac.authorization.k8s.io/v1"
+	objectsv1 "github.com/rancher/rancher/pkg/generated/objects/rbac.authorization.k8s.io/v1"
 	"github.com/rancher/rancher/pkg/webhook/resources/common"
 	"github.com/rancher/webhook/pkg/admission"
 	admissionv1 "k8s.io/api/admission/v1"

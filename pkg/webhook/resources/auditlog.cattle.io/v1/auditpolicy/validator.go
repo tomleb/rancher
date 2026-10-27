@@ -7,7 +7,7 @@ import (
 
 	jsonpath "github.com/rancher/jsonpath/pkg"
 	auditlogv1 "github.com/rancher/rancher/pkg/apis/auditlog.cattle.io/v1"
-	v1 "github.com/rancher/rancher/pkg/webhook/generated/objects/auditlog.cattle.io/v1"
+	v1 "github.com/rancher/rancher/pkg/generated/objects/auditlog.cattle.io/v1"
 	"github.com/rancher/webhook/pkg/admission"
 	admissionv1 "k8s.io/api/admission/v1"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"

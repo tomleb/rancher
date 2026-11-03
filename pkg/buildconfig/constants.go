@@ -22,7 +22,7 @@ const MachineProvisionImage = "rancher/machine:v0.15.0-rancher146-rc.7"
 
 const PartnerChartDefaultBranch = "main"
 
-const RemoteDialerProxyVersion = "111.0.0+up0.9.1-rc.1"
+const RemoteDialerProxyVersion = "111.0.0+up0.9.1-rc.99"
 
 const Rke2ChartDefaultBranch = "main"
 

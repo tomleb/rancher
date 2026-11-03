@@ -28,7 +28,7 @@ winsAgentVersion: v0.16.0-rc.99
 # Charts Versions
 fleetVersion: 111.0.0+up0.17.0-beta.99
 
-remoteDialerProxyVersion: 111.0.0+up0.9.1-rc.1
+remoteDialerProxyVersion: 111.0.0+up0.9.1-rc.99
 
 turtlesVersion: 111.0.0+up0.28.0-rc.99
 

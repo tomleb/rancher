@@ -32,4 +32,4 @@ const TurtlesVersion = "111.0.0+up0.28.0-rc.99"
 
 const WebhookVersion = "111.0.0+up0.12.1-rc.99"
 
-const WinsAgentVersion = "v0.16.0-rc.9"
+const WinsAgentVersion = "v0.16.0-rc.99"

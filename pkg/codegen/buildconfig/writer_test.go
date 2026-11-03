@@ -22,9 +22,7 @@ func TestGoConstantsWriterRun(t *testing.T) {
 	const rawTemplate = `
 	package buildconfig
 
-	const (
-	{{ . }})
-	`
+	{{ . }}`
 	tmpl, err := template.New("").Parse(rawTemplate)
 	require.NoError(t, err)
 	w := &main.GoConstantsWriter{
@@ -37,11 +35,11 @@ func TestGoConstantsWriterRun(t *testing.T) {
 	want :=
 		`package buildconfig
 
-const (
-	A = "foo"
-	B = "3"
-	C = "3.14"
-)
+const A = "foo"
+
+const B = "3"
+
+const C = "3.14"
 `
 	got := out.String()
 	require.Equal(t, want, got)

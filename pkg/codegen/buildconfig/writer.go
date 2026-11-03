@@ -48,13 +48,18 @@ func (f *GoConstantsWriter) process() error {
 	sort.Strings(keys)
 
 	capitalize := cases.Title(language.English, cases.NoLower)
+	// Each constant is a standalone declaration separated by a blank line, rather than an
+	// aligned const block. Concurrent PRs bumping different keys then touch non-adjacent
+	// lines, and a longer key name doesn't realign (and conflict on) every other line.
 	var builder strings.Builder
-	for _, k := range keys {
+	for i, k := range keys {
+		if i > 0 {
+			builder.WriteString("\n")
+		}
 		v := f.Config[k]
 		// Capitalize the key to make the constant exported in the generated Go file.
 		k = capitalize.String(k)
-		s := fmt.Sprintf("\t%s = %q\n", k, v)
-		builder.WriteString(s)
+		builder.WriteString(fmt.Sprintf("const %s = %q\n", k, v))
 	}
 
 	buf := new(bytes.Buffer)

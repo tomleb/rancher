@@ -143,9 +143,7 @@ func generateGoConstantsFile(cfg map[string]string) error {
 // Package buildconfig contains a set of exported constants that represent configuration variables of Rancher at build-time.
 package buildconfig
 
-const (
-{{ . }})
-`
+{{ . }}`
 	tmpl, err := template.New("").Parse(raw)
 	if err != nil {
 		return err

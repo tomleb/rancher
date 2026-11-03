@@ -2,21 +2,34 @@
 // Package buildconfig contains a set of exported constants that represent configuration variables of Rancher at build-time.
 package buildconfig
 
-const (
-	ChartAuditLogImage        = "rancher/mirrored-bci-micro:16.0-15.11"
-	ChartDefaultBranch        = "dev-v2.16"
-	ClusterAPIControllerImage = "rancher/cluster-api-controller:v1.14.3"
-	DefaultAssetsImage        = "rancher/rancher-assets:v2.16-20261027T2136Z-dev"
-	DefaultKubeAPIAuthImage   = "rancher/kube-api-auth:v0.16.0-rc.4"
-	DefaultSccOperatorImage   = "rancher/scc-operator:v0.5.3"
-	DefaultShellVersion       = "rancher/shell:v0.9.0-rc.1"
-	FleetVersion              = "111.0.0+up0.17.0-beta.2"
-	MachineProvisionImage     = "rancher/machine:v0.15.0-rancher146-rc.7"
-	PartnerChartDefaultBranch = "main"
-	RemoteDialerProxyVersion  = "111.0.0+up0.9.1-rc.1"
-	Rke2ChartDefaultBranch    = "main"
-	SystemAgentVersion        = "v0.16.0-rc.5"
-	TurtlesVersion            = "111.0.0+up0.28.0-rc.3"
-	WebhookVersion            = "111.0.0+up0.12.1-rc.15"
-	WinsAgentVersion          = "v0.16.0-rc.9"
-)
+const ChartAuditLogImage = "rancher/mirrored-bci-micro:16.0-15.11"
+
+const ChartDefaultBranch = "dev-v2.16"
+
+const ClusterAPIControllerImage = "rancher/cluster-api-controller:v1.14.3"
+
+const DefaultAssetsImage = "rancher/rancher-assets:v2.16-20261027T2136Z-dev"
+
+const DefaultKubeAPIAuthImage = "rancher/kube-api-auth:v0.16.0-rc.4"
+
+const DefaultSccOperatorImage = "rancher/scc-operator:v0.5.3"
+
+const DefaultShellVersion = "rancher/shell:v0.9.0-rc.1"
+
+const FleetVersion = "111.0.0+up0.17.0-beta.2"
+
+const MachineProvisionImage = "rancher/machine:v0.15.0-rancher146-rc.7"
+
+const PartnerChartDefaultBranch = "main"
+
+const RemoteDialerProxyVersion = "111.0.0+up0.9.1-rc.1"
+
+const Rke2ChartDefaultBranch = "main"
+
+const SystemAgentVersion = "v0.16.0-rc.5"
+
+const TurtlesVersion = "111.0.0+up0.28.0-rc.3"
+
+const WebhookVersion = "111.0.0+up0.12.1-rc.15"
+
+const WinsAgentVersion = "v0.16.0-rc.9"

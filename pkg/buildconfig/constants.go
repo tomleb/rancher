@@ -16,7 +16,7 @@ const DefaultSccOperatorImage = "rancher/scc-operator:v0.5.3"
 
 const DefaultShellVersion = "rancher/shell:v0.9.0-rc.1"
 
-const FleetVersion = "111.0.0+up0.17.0-beta.2"
+const FleetVersion = "111.0.0+up0.17.0-beta.99"
 
 const MachineProvisionImage = "rancher/machine:v0.15.0-rancher146-rc.7"
 

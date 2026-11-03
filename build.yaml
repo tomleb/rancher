@@ -26,7 +26,7 @@ systemAgentVersion: v0.16.0-rc.5
 winsAgentVersion: v0.16.0-rc.9
 
 # Charts Versions
-fleetVersion: 111.0.0+up0.17.0-beta.2
+fleetVersion: 111.0.0+up0.17.0-beta.99
 
 remoteDialerProxyVersion: 111.0.0+up0.9.1-rc.1
 

@@ -26,7 +26,7 @@ const RemoteDialerProxyVersion = "111.0.0+up0.9.1-rc.1"
 
 const Rke2ChartDefaultBranch = "main"
 
-const SystemAgentVersion = "v0.16.0-rc.5"
+const SystemAgentVersion = "v0.16.0-rc.99"
 
 const TurtlesVersion = "111.0.0+up0.28.0-rc.3"
 

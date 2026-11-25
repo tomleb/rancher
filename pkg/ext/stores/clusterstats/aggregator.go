@@ -122,7 +122,8 @@ func (a *aggregator) onClusterChange(key string, cluster *apiv3.Cluster) (*apiv3
 }
 
 // compute aggregates the stats of a cluster from its nodes. The logic matches
-// pkg/controllers/management/clusterstats.
+// what the cluster-stats controller (pkg/controllers/management/clusterstats)
+// used to write to the Cluster status.
 func (a *aggregator) compute(clusterName string) (ext.ClusterStatStatus, error) {
 	allNodes, err := a.nodeCache.List(clusterName, labels.Everything())
 	if err != nil {

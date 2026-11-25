@@ -2,41 +2,34 @@ package clusterstats
 
 import (
 	"context"
-	"reflect"
-	"regexp"
 	"sync"
 	"time"
 
-	"github.com/pkg/errors"
 	apimgmtv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	"github.com/rancher/rancher/pkg/clustermanager"
 	v3 "github.com/rancher/rancher/pkg/generated/norman/management.cattle.io/v3"
 	"github.com/rancher/rancher/pkg/types/config"
 	"github.com/sirupsen/logrus"
-	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
 const (
-	nodeRoleControlPlane       = "node-role.kubernetes.io/controlplane"
-	nodeRoleControlPlaneHyphen = "node-role.kubernetes.io/control-plane"
-	nodeRoleETCD               = "node-role.kubernetes.io/etcd"
-
-	// quietPeriod marks the minimum period between sync calls for the same Cluster.
-	// The stats are also served live, from memory, by the ext.cattle.io ClusterStat
-	// API (see pkg/ext/stores/clusterstats), so they're only persisted to the
-	// Cluster status at a slow pace to limit the writes to etcd.
-	quietPeriod = 2 * time.Minute
+	// quietPeriod marks the minimum period between sync calls for the same Cluster
+	quietPeriod = time.Second * 10
 )
 
-var numericReg = regexp.MustCompile("[^0-9]")
-
+// StatsAggregator used to aggregate node stats (node counts, capacity,
+// allocatable, requested, limits and the NoDiskPressure/NoMemoryPressure
+// conditions) into the Cluster status. Those stats are now served from memory
+// by the ext.cattle.io ClusterStat API (see pkg/ext/stores/clusterstats) and
+// the corresponding Cluster status fields are no longer updated.
+//
+// The controller still records the Kubernetes version of the cluster in the
+// Cluster status, removes a legacy annotation from the cluster agent, and
+// enqueues the Cluster when its Nodes change.
 type StatsAggregator struct {
-	NodesLister    v3.NodeLister
 	Clusters       v3.ClusterInterface
 	ClusterManager *clustermanager.Manager
 
@@ -44,21 +37,11 @@ type StatsAggregator struct {
 	lastReconcile sync.Map
 }
 
-type ClusterNodeData struct {
-	Capacity                        v1.ResourceList
-	Allocatable                     v1.ResourceList
-	Requested                       v1.ResourceList
-	Limits                          v1.ResourceList
-	ConditionNoDiskPressureStatus   v1.ConditionStatus
-	ConditionNoMemoryPressureStatus v1.ConditionStatus
-}
-
 func Register(ctx context.Context, management *config.ManagementContext, clusterManager *clustermanager.Manager) {
 	clustersClient := management.Management.Clusters("")
 	machinesClient := management.Management.Nodes("")
 
 	s := &StatsAggregator{
-		NodesLister:    machinesClient.Controller().Lister(),
 		Clusters:       clustersClient,
 		ClusterManager: clusterManager,
 	}
@@ -81,7 +64,7 @@ func (s *StatsAggregator) sync(key string, cluster *apimgmtv3.Cluster) (runtime.
 		return nil, nil
 	}
 
-	updated, err := s.aggregate(cluster)
+	updated, err := s.reconcile(cluster)
 	if err == nil {
 		s.lastReconcile.Store(key, time.Now())
 	}
@@ -100,116 +83,18 @@ func (s *StatsAggregator) getMinimumWaitTime(key string) time.Duration {
 	return 0
 }
 
-func (s *StatsAggregator) aggregate(cluster *apimgmtv3.Cluster) (*apimgmtv3.Cluster, error) {
-	allMachines, err := s.NodesLister.List(cluster.Name, labels.Everything())
-	if err != nil {
-		return nil, err
-	}
-
-	workerCounts := make(map[string]int)
-	var machines []*apimgmtv3.Node
-	// only include worker nodes
-	for _, m := range allMachines {
-		// if none are set, then nodes syncer has not completed
-		if !m.Spec.Worker && !m.Spec.ControlPlane && !m.Spec.Etcd {
-			return nil, errors.Errorf("node role cannot be determined because node %s has not finished syncing. retrying", m.Status.NodeName)
-		}
-		if isTaintedNoExecuteNoSchedule(m) && !m.Spec.Worker {
-			continue
-		}
-		if m.Spec.InternalNodeSpec.Unschedulable {
-			continue
-		}
-
-		if os, ok := m.Status.NodeLabels["kubernetes.io/os"]; ok && m.Spec.Worker {
-			workerCounts[os]++
-		}
-
-		machines = append(machines, m)
-	}
-
+func (s *StatsAggregator) reconcile(cluster *apimgmtv3.Cluster) (*apimgmtv3.Cluster, error) {
 	origStatus := cluster.Status.DeepCopy()
 	cluster = cluster.DeepCopy()
-
-	cluster.Status.NodeCount = len(allMachines)
-	if c, ok := workerCounts["windows"]; ok {
-		cluster.Status.WindowsWorkerCount = c
-	}
-	if c, ok := workerCounts["linux"]; ok {
-		cluster.Status.LinuxWorkerCount = c
-	}
-
-	// capacity keys
-	pods, mem, cpu := resource.Quantity{}, resource.Quantity{}, resource.Quantity{}
-	// allocatable keys
-	apods, amem, acpu := resource.Quantity{}, resource.Quantity{}, resource.Quantity{}
-	// requested keys
-	rpods, rmem, rcpu := resource.Quantity{}, resource.Quantity{}, resource.Quantity{}
-	// limited keys
-	lpods, lmem, lcpu := resource.Quantity{}, resource.Quantity{}, resource.Quantity{}
-
-	condDisk := v1.ConditionTrue
-	condMem := v1.ConditionTrue
-
-	for _, machine := range machines {
-		capacity := machine.Status.InternalNodeStatus.Capacity
-		if capacity != nil {
-			pods.Add(*capacity.Pods())
-			mem.Add(*capacity.Memory())
-			cpu.Add(*capacity.Cpu())
-		}
-		allocatable := machine.Status.InternalNodeStatus.Allocatable
-		if allocatable != nil {
-			apods.Add(*allocatable.Pods())
-			amem.Add(*allocatable.Memory())
-			acpu.Add(*allocatable.Cpu())
-		}
-		requested := machine.Status.Requested
-		if requested != nil {
-			rpods.Add(*requested.Pods())
-			rmem.Add(*requested.Memory())
-			rcpu.Add(*requested.Cpu())
-		}
-		limits := machine.Status.Limits
-		if limits != nil {
-			lpods.Add(*limits.Pods())
-			lmem.Add(*limits.Memory())
-			lcpu.Add(*limits.Cpu())
-		}
-
-		if apimgmtv3.ClusterConditionNoDiskPressure.IsTrue(machine) {
-			condDisk = v1.ConditionFalse
-		}
-		if apimgmtv3.ClusterConditionNoMemoryPressure.IsTrue(machine) {
-			condMem = v1.ConditionFalse
-		}
-	}
-
-	cluster.Status.Capacity = v1.ResourceList{v1.ResourcePods: pods, v1.ResourceMemory: mem, v1.ResourceCPU: cpu}
-	cluster.Status.Allocatable = v1.ResourceList{v1.ResourcePods: apods, v1.ResourceMemory: amem, v1.ResourceCPU: acpu}
-	cluster.Status.Requested = v1.ResourceList{v1.ResourcePods: rpods, v1.ResourceMemory: rmem, v1.ResourceCPU: rcpu}
-	cluster.Status.Limits = v1.ResourceList{v1.ResourcePods: lpods, v1.ResourceMemory: lmem, v1.ResourceCPU: lcpu}
-
-	if condDisk == v1.ConditionTrue {
-		apimgmtv3.ClusterConditionNoDiskPressure.True(cluster)
-	} else {
-		apimgmtv3.ClusterConditionNoDiskPressure.False(cluster)
-	}
-	if condMem == v1.ConditionTrue {
-		apimgmtv3.ClusterConditionNoMemoryPressure.True(cluster)
-	} else {
-		apimgmtv3.ClusterConditionNoMemoryPressure.False(cluster)
-	}
 
 	s.updateVersion(cluster)
 
 	// Remove "agent.cluster.cattle.io/upgraded-v1.22" annotation
-	err = s.removeLegacyUpgradedAnnotation(cluster)
-	if err != nil {
+	if err := s.removeLegacyUpgradedAnnotation(cluster); err != nil {
 		return nil, err
 	}
 
-	if statusChanged(origStatus, &cluster.Status) {
+	if versionChanged(origStatus, &cluster.Status) {
 		// Use UpdateStatus to only update the status subresource - Update() ignores status changes.
 		// Return nil to avoid norman's redundant Update() write-back.
 		if _, err := s.Clusters.UpdateStatus(cluster); err != nil {
@@ -285,56 +170,12 @@ func (s *StatsAggregator) removeLegacyUpgradedAnnotation(cluster *apimgmtv3.Clus
 	return nil
 }
 
-func statusChanged(currentStatus, newStatus *apimgmtv3.ClusterStatus) bool {
-	if !reflect.DeepEqual(currentStatus.Conditions, newStatus.Conditions) {
-		return true
-	}
-
-	if currentStatus.LinuxWorkerCount != newStatus.LinuxWorkerCount ||
-		currentStatus.WindowsWorkerCount != newStatus.WindowsWorkerCount ||
-		currentStatus.NodeCount != newStatus.NodeCount {
-		return true
-	}
-
-	if resourceListChanged(currentStatus.Capacity, newStatus.Capacity) {
-		return true
-	}
-
-	if resourceListChanged(currentStatus.Allocatable, newStatus.Allocatable) {
-		return true
-	}
-
-	if resourceListChanged(currentStatus.Requested, newStatus.Requested) {
-		return true
-	}
-
-	if resourceListChanged(currentStatus.Limits, newStatus.Limits) {
-		return true
-	}
-
+func versionChanged(currentStatus, newStatus *apimgmtv3.ClusterStatus) bool {
 	currentVersionOk := currentStatus.Version != nil
 	versionOk := newStatus.Version != nil
 
 	// if we don't have an older version recorded, the new one could not be queried, or they are both populated and different
-	if currentVersionOk != versionOk || (currentVersionOk && *currentStatus.Version != *newStatus.Version) {
-		return true
-	}
-
-	return false
-}
-
-func resourceListChanged(oldList, newList v1.ResourceList) bool {
-	if len(oldList) != len(newList) {
-		return true
-	}
-
-	for k, v := range oldList {
-		if v.Cmp(newList[k]) != 0 {
-			return true
-		}
-	}
-
-	return false
+	return currentVersionOk != versionOk || (currentVersionOk && *currentStatus.Version != *newStatus.Version)
 }
 
 func callWithTimeout(do func()) {
@@ -363,14 +204,4 @@ func (s *StatsAggregator) machineChanged(_ string, machine *apimgmtv3.Node) (run
 	}
 
 	return nil, nil
-}
-
-func isTaintedNoExecuteNoSchedule(machine *apimgmtv3.Node) bool {
-	for _, taint := range machine.Spec.InternalNodeSpec.Taints {
-		isServer := taint.Key == nodeRoleControlPlane || taint.Key == nodeRoleETCD || taint.Key == nodeRoleControlPlaneHyphen
-		if isServer && (taint.Effect == "NoSchedule" || taint.Effect == "NoExecute") {
-			return true
-		}
-	}
-	return false
 }

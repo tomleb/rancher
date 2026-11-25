@@ -31,6 +31,7 @@ func init() {
 }
 
 type Interface interface {
+	ClusterStat() ClusterStatController
 	GroupMembershipRefreshRequest() GroupMembershipRefreshRequestController
 	Kubeconfig() KubeconfigController
 	PasswordChangeRequest() PasswordChangeRequestController
@@ -47,6 +48,10 @@ func New(controllerFactory controller.SharedControllerFactory) Interface {
 
 type version struct {
 	controllerFactory controller.SharedControllerFactory
+}
+
+func (v *version) ClusterStat() ClusterStatController {
+	return generic.NewNonNamespacedController[*v1.ClusterStat, *v1.ClusterStatList](schema.GroupVersionKind{Group: "ext.cattle.io", Version: "v1", Kind: "ClusterStat"}, "clusterstats", v.controllerFactory)
 }
 
 func (v *version) GroupMembershipRefreshRequest() GroupMembershipRefreshRequestController {

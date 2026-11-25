@@ -152,6 +152,7 @@ func main() {
 				GenerateTypes:   true,
 				GenerateOpenAPI: true,
 				OpenAPIDependencies: []string{
+					"k8s.io/apimachinery/pkg/api/resource",
 					"k8s.io/apimachinery/pkg/apis/meta/v1",
 					"k8s.io/apimachinery/pkg/runtime",
 					"k8s.io/apimachinery/pkg/version",

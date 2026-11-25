@@ -3,6 +3,7 @@ package v1
 
 import (
 	apiv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -415,4 +416,47 @@ type SelfUser struct {
 // SelfUserStatus defines the most recently observed status of the SelfUser
 type SelfUserStatus struct {
 	UserID string `json:"userID,omitempty"`
+}
+
+// +genclient
+// +genclient:nonNamespaced
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// ClusterStat holds resource statistics aggregated from the nodes of a
+// management cluster. Its name is the name of the management.cattle.io Cluster
+// it describes.
+//
+// ClusterStats are computed in memory by Rancher from the management.cattle.io
+// Nodes of the cluster and are never persisted. Only the get and list verbs are
+// supported.
+type ClusterStat struct {
+	metav1.TypeMeta `json:",inline"`
+	// Standard object metadata; More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata.
+	// +optional
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	// Status is the most recently observed statistics of the cluster.
+	// +optional
+	Status ClusterStatStatus `json:"status,omitempty"`
+}
+
+// ClusterStatStatus contains the statistics aggregated from the nodes of a cluster.
+type ClusterStatStatus struct {
+	// NodeCount is the number of nodes in the cluster.
+	NodeCount int `json:"nodeCount"`
+	// LinuxWorkerCount is the number of schedulable Linux worker nodes.
+	LinuxWorkerCount int `json:"linuxWorkerCount"`
+	// WindowsWorkerCount is the number of schedulable Windows worker nodes.
+	WindowsWorkerCount int `json:"windowsWorkerCount"`
+	// Capacity is the sum of the capacity (cpu, memory, pods) of the schedulable nodes.
+	// +optional
+	Capacity map[string]resource.Quantity `json:"capacity,omitempty"`
+	// Allocatable is the sum of the allocatable resources (cpu, memory, pods) of the schedulable nodes.
+	// +optional
+	Allocatable map[string]resource.Quantity `json:"allocatable,omitempty"`
+	// Requested is the sum of the resources (cpu, memory, pods) requested on the schedulable nodes.
+	// +optional
+	Requested map[string]resource.Quantity `json:"requested,omitempty"`
+	// Limits is the sum of the resource limits (cpu, memory, pods) on the schedulable nodes.
+	// +optional
+	Limits map[string]resource.Quantity `json:"limits,omitempty"`
 }

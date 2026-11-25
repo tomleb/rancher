@@ -28,6 +28,23 @@ import (
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
+// ClusterStatList is a list of ClusterStat resources
+type ClusterStatList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata"`
+
+	Items []ClusterStat `json:"items"`
+}
+
+func NewClusterStat(namespace, name string, obj ClusterStat) *ClusterStat {
+	obj.APIVersion, obj.Kind = SchemeGroupVersion.WithKind("ClusterStat").ToAPIVersionAndKind()
+	obj.Name = name
+	obj.Namespace = namespace
+	return &obj
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
 // GroupMembershipRefreshRequestList is a list of GroupMembershipRefreshRequest resources
 type GroupMembershipRefreshRequestList struct {
 	metav1.TypeMeta `json:",inline"`

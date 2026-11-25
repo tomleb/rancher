@@ -1,9 +1,11 @@
 package stores
 
 import (
+	"context"
 	"fmt"
 
 	extv1 "github.com/rancher/rancher/pkg/apis/ext.cattle.io/v1"
+	"github.com/rancher/rancher/pkg/ext/stores/clusterstats"
 	"github.com/rancher/rancher/pkg/ext/stores/groupmembershiprefreshrequest"
 	"github.com/rancher/rancher/pkg/ext/stores/kubeconfig"
 	"github.com/rancher/rancher/pkg/ext/stores/passwordchangerequest"
@@ -19,6 +21,7 @@ import (
 )
 
 func InstallStores(
+	ctx context.Context,
 	server *steveext.ExtensionAPIServer,
 	wranglerContext *wrangler.Context,
 	scheme *runtime.Scheme,
@@ -98,6 +101,19 @@ func InstallStores(
 		return fmt.Errorf("unable to install %s store: %w", selfuser.SingularName, err)
 	}
 	logrus.Infof("Successfully installed %s store", selfuser.SingularName)
+
+	// ClusterStats are aggregated from management.cattle.io Nodes, which only
+	// exist when MCM is enabled.
+	if features.MCM.Enabled() {
+		if err = server.Install(
+			extv1.ClusterStatResourceName,
+			clusterstats.GVK,
+			clusterstats.New(ctx, wranglerContext),
+		); err != nil {
+			return fmt.Errorf("unable to install %s store: %w", clusterstats.SingularName, err)
+		}
+		logrus.Infof("Successfully installed %s store", clusterstats.SingularName)
+	}
 
 	return nil
 }

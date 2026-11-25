@@ -22,6 +22,21 @@ limitations under the License.
 package v1
 
 // OpenAPIModelName returns the OpenAPI model name for this type.
+func (in ClusterStat) OpenAPIModelName() string {
+	return "ext.cattle.io.v1.ClusterStat"
+}
+
+// OpenAPIModelName returns the OpenAPI model name for this type.
+func (in ClusterStatList) OpenAPIModelName() string {
+	return "ext.cattle.io.v1.ClusterStatList"
+}
+
+// OpenAPIModelName returns the OpenAPI model name for this type.
+func (in ClusterStatStatus) OpenAPIModelName() string {
+	return "ext.cattle.io.v1.ClusterStatStatus"
+}
+
+// OpenAPIModelName returns the OpenAPI model name for this type.
 func (in GroupMembershipRefreshRequest) OpenAPIModelName() string {
 	return "ext.cattle.io.v1.GroupMembershipRefreshRequest"
 }

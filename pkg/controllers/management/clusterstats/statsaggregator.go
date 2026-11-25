@@ -26,8 +26,11 @@ const (
 	nodeRoleControlPlaneHyphen = "node-role.kubernetes.io/control-plane"
 	nodeRoleETCD               = "node-role.kubernetes.io/etcd"
 
-	// quietPeriod marks the minimum period between sync calls for the same Cluster
-	quietPeriod = time.Second * 10
+	// quietPeriod marks the minimum period between sync calls for the same Cluster.
+	// The stats are also served live, from memory, by the ext.cattle.io ClusterStat
+	// API (see pkg/ext/stores/clusterstats), so they're only persisted to the
+	// Cluster status at a slow pace to limit the writes to etcd.
+	quietPeriod = 2 * time.Minute
 )
 
 var numericReg = regexp.MustCompile("[^0-9]")

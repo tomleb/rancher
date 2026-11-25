@@ -437,6 +437,12 @@ func TestSyncNoUpdateWhenSteadyState(t *testing.T) {
 						ResourceNames: []string{clusterName},
 						Verbs:         getExpectedVerbs(name),
 					},
+					{
+						APIGroups:     []string{"ext.cattle.io"},
+						Resources:     []string{"clusterstats"},
+						ResourceNames: []string{clusterName},
+						Verbs:         []string{"get"},
+					},
 				},
 			}, nil
 		}).AnyTimes()

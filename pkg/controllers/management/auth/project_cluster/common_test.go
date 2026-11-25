@@ -118,6 +118,12 @@ func TestCreateClusterMembershipRoles(t *testing.T) {
 				ResourceNames: []string{"test-cluster"},
 				Verbs:         []string{"get"},
 			},
+			{
+				APIGroups:     []string{"ext.cattle.io"},
+				Resources:     []string{"clusterstats"},
+				ResourceNames: []string{"test-cluster"},
+				Verbs:         []string{"get"},
+			},
 		},
 	}
 	ownerRole := &rbacv1.ClusterRole{
@@ -134,6 +140,12 @@ func TestCreateClusterMembershipRoles(t *testing.T) {
 				Resources:     []string{"clusters"},
 				ResourceNames: []string{"test-cluster"},
 				Verbs:         []string{"get", "update", "delete", "patch", "create", "list", "watch", "deletecollection"},
+			},
+			{
+				APIGroups:     []string{"ext.cattle.io"},
+				Resources:     []string{"clusterstats"},
+				ResourceNames: []string{"test-cluster"},
+				Verbs:         []string{"get"},
 			},
 		},
 	}

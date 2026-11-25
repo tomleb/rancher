@@ -3,6 +3,7 @@ package project_cluster
 import (
 	"fmt"
 
+	extv1 "github.com/rancher/rancher/pkg/apis/ext.cattle.io/v1"
 	apisv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	"github.com/rancher/rancher/pkg/rbac"
 	corev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
@@ -146,6 +147,7 @@ func createClusterMembershipRoles(cluster *apisv3.Cluster, crClient crbacv1.Clus
 				ResourceNames: []string{cluster.Name},
 				Verbs:         []string{"get"},
 			},
+			clusterStatRule(cluster),
 		},
 	}
 
@@ -162,6 +164,7 @@ func createClusterMembershipRoles(cluster *apisv3.Cluster, crClient crbacv1.Clus
 				ResourceNames: []string{cluster.Name},
 				Verbs:         allNonCustomVerbs,
 			},
+			clusterStatRule(cluster),
 		},
 	}
 
@@ -172,6 +175,19 @@ func createClusterMembershipRoles(cluster *apisv3.Cluster, crClient crbacv1.Clus
 	}
 
 	return nil
+}
+
+// clusterStatRule grants read access to the ext.cattle.io ClusterStat of the
+// cluster. ClusterStats are named after their cluster and are read-only, so
+// both members and owners only get the get verb. Listing works through steve,
+// which turns resourceName-scoped get permissions into list results.
+func clusterStatRule(cluster *apisv3.Cluster) rbacv1.PolicyRule {
+	return rbacv1.PolicyRule{
+		APIGroups:     []string{extv1.SchemeGroupVersion.Group},
+		Resources:     []string{extv1.ClusterStatResourceName},
+		ResourceNames: []string{cluster.Name},
+		Verbs:         []string{"get"},
+	}
 }
 
 // newOwnerReference create an OwnerReference from a runtime.Object.

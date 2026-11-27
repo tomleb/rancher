@@ -311,11 +311,12 @@ func TestEnsureInternalCertSANs_DeleteNotFound(t *testing.T) {
 // TestGetClusterIP verifies the tls-rancher-internal cert is built from the
 // same Service that apiservice uses for the internal server URL: the
 // cattle-cluster-agent Service when running as the downstream agent
-// (MCMAgent), rancher-internal otherwise.
+// (MCMAgent), "<chart fullname>-internal" otherwise.
 func TestGetClusterIP(t *testing.T) {
 	tests := []struct {
 		name        string
 		mcmAgent    bool
+		fullname    string // IMPERATIVE_API_APP_SELECTOR, set by the chart
 		serviceName string
 		service     *corev1.Service
 		getErr      error
@@ -327,6 +328,20 @@ func TestGetClusterIP(t *testing.T) {
 			serviceName: "rancher-internal",
 			service:     &corev1.Service{Spec: corev1.ServiceSpec{ClusterIP: "10.43.0.10"}},
 			want:        "10.43.0.10",
+		},
+		{
+			name:        "chart install with default fullname uses rancher-internal",
+			fullname:    "rancher",
+			serviceName: "rancher-internal",
+			service:     &corev1.Service{Spec: corev1.ServiceSpec{ClusterIP: "10.43.0.11"}},
+			want:        "10.43.0.11",
+		},
+		{
+			name:        "chart install with custom fullname uses <fullname>-internal",
+			fullname:    "my-release-rancher",
+			serviceName: "my-release-rancher-internal",
+			service:     &corev1.Service{Spec: corev1.ServiceSpec{ClusterIP: "10.43.0.12"}},
+			want:        "10.43.0.12",
 		},
 		{
 			name:        "agent uses cattle-cluster-agent",
@@ -352,7 +367,8 @@ func TestGetClusterIP(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Not parallel: toggles the global MCMAgent feature.
+			// Not parallel: toggles the global MCMAgent feature and env.
+			t.Setenv("IMPERATIVE_API_APP_SELECTOR", tt.fullname)
 			features.MCMAgent.Set(tt.mcmAgent)
 			t.Cleanup(func() { features.MCMAgent.Set(false) })
 

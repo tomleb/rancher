@@ -395,7 +395,7 @@ func getClusterIP(services corev1controllers.ServiceController) (string, error) 
 }
 
 func getHostIPs(deployments appscontrollers.DeploymentController, nodes corev1controllers.NodeController) ([]string, error) {
-	deployment, err := deployments.Get(namespace.System, commonName, metav1.GetOptions{})
+	deployment, err := deployments.Get(namespace.System, apiservice.RancherFullname(), metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, nil

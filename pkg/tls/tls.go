@@ -125,14 +125,14 @@ func ListenAndServe(ctx context.Context, restConfig *rest.Config, handler http.H
 	}
 
 	// Always include localhost, 127.0.0.1, and the in-cluster DNS names
-	// (short and FQDN forms) for the rancher-internal Service as default
+	// (short and FQDN forms) for the internal Service as default
 	// SANs, alongside the dynamic pod/cluster IPs below. These are
 	// admin-controlled Config.SANs (short-circuited by dynamiclistener's
 	// allowDefaultSANs before FilterCN ever runs), so they're always
 	// present regardless of what the pod-IP/Service-allowlist filter
 	// would otherwise decide -- and unlike those IPs, they don't change
 	// across restarts.
-	internalSvcName := apiservice.RancherInternalServiceName + "." + namespace.System + ".svc"
+	internalSvcName := apiservice.InternalServiceName() + "." + namespace.System + ".svc"
 	hostIPs = append(hostIPs, "localhost", "127.0.0.1", internalSvcName, internalSvcName+".cluster.local")
 
 	if clusterIP != "" {
@@ -372,11 +372,15 @@ func readConfig(ctx context.Context, secrets corev1controllers.SecretController,
 	return ca, noCACerts, opts, nil
 }
 
-// getClusterIP retrieves the ClusterIP of the rancher-internal service.
+// getClusterIP retrieves the ClusterIP of the internal service (see
+// apiservice.InternalServiceName). It must match the Service that
+// apiservice uses to build the internal server URL, otherwise the
+// tls-rancher-internal cert won't cover the IP clients connect to.
 // It returns the ClusterIP as a string, or an error if the service exists but is not assigned an IP.
 // If the service does not exist, it returns an empty string and no error.
 func getClusterIP(services corev1controllers.ServiceController) (string, error) {
-	service, err := services.Get(namespace.System, apiservice.RancherInternalServiceName, metav1.GetOptions{})
+	serviceName := apiservice.InternalServiceName()
+	service, err := services.Get(namespace.System, serviceName, metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return "", nil
@@ -385,7 +389,7 @@ func getClusterIP(services corev1controllers.ServiceController) (string, error) 
 	}
 	if service.Spec.ClusterIP == "" {
 		return "", fmt.Errorf("waiting on service %s/%s to be assigned a ClusterIP",
-			namespace.System, apiservice.RancherInternalServiceName)
+			namespace.System, serviceName)
 	}
 	return service.Spec.ClusterIP, nil
 }

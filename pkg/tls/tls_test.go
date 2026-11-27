@@ -307,3 +307,69 @@ func TestEnsureInternalCertSANs_DeleteNotFound(t *testing.T) {
 		t.Fatalf("expected nil error on NotFound delete, got: %v", err)
 	}
 }
+
+// TestGetClusterIP verifies the tls-rancher-internal cert is built from the
+// same Service that apiservice uses for the internal server URL: the
+// cattle-cluster-agent Service when running as the downstream agent
+// (MCMAgent), rancher-internal otherwise.
+func TestGetClusterIP(t *testing.T) {
+	tests := []struct {
+		name        string
+		mcmAgent    bool
+		serviceName string
+		service     *corev1.Service
+		getErr      error
+		want        string
+		wantErr     bool
+	}{
+		{
+			name:        "rancher server uses rancher-internal",
+			serviceName: "rancher-internal",
+			service:     &corev1.Service{Spec: corev1.ServiceSpec{ClusterIP: "10.43.0.10"}},
+			want:        "10.43.0.10",
+		},
+		{
+			name:        "agent uses cattle-cluster-agent",
+			mcmAgent:    true,
+			serviceName: "cattle-cluster-agent",
+			service:     &corev1.Service{Spec: corev1.ServiceSpec{ClusterIP: "10.43.0.20"}},
+			want:        "10.43.0.20",
+		},
+		{
+			name:        "service not found returns empty",
+			mcmAgent:    true,
+			serviceName: "cattle-cluster-agent",
+			getErr:      apierrors.NewNotFound(schema.GroupResource{Resource: "services"}, "cattle-cluster-agent"),
+			want:        "",
+		},
+		{
+			name:        "service without ClusterIP is an error",
+			mcmAgent:    true,
+			serviceName: "cattle-cluster-agent",
+			service:     &corev1.Service{},
+			wantErr:     true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Not parallel: toggles the global MCMAgent feature.
+			features.MCMAgent.Set(tt.mcmAgent)
+			t.Cleanup(func() { features.MCMAgent.Set(false) })
+
+			ctrl := gomock.NewController(t)
+			services := fake.NewMockControllerInterface[*corev1.Service, *corev1.ServiceList](ctrl)
+			services.EXPECT().
+				Get(namespace.System, tt.serviceName, gomock.Any()).
+				Return(tt.service, tt.getErr).
+				Times(1)
+
+			got, err := getClusterIP(services)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("getClusterIP() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("getClusterIP() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

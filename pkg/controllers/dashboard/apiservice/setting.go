@@ -14,6 +14,22 @@ import (
 const RancherServiceName = "rancher"
 const RancherInternalServiceName = "rancher-internal"
 
+// AgentServiceName is the Service fronting the cattle-cluster-agent pods on a
+// downstream cluster. It plays the role of RancherInternalServiceName there.
+const AgentServiceName = "cattle-cluster-agent"
+
+// InternalServiceName returns the name of the Service in cattle-system that
+// fronts this process's internal (:444) listener: cattle-cluster-agent when
+// running as the downstream agent, rancher-internal otherwise. The internal
+// server URL and the tls-rancher-internal cert's SANs must both be derived
+// from it, or clients of the internal URL fail the TLS handshake.
+func InternalServiceName() string {
+	if features.MCMAgent.Enabled() {
+		return AgentServiceName
+	}
+	return RancherInternalServiceName
+}
+
 func (h *handler) SetupInternalServerURL(key string, setting *v3.Setting) (*v3.Setting, error) {
 	if key != settings.ServerURL.Name {
 		return setting, nil
@@ -41,10 +57,7 @@ func (h *handler) SetupInternalServerURL(key string, setting *v3.Setting) (*v3.S
 }
 
 func (h *handler) getClusterIP() (string, error) {
-	serviceName := RancherInternalServiceName
-	if features.MCMAgent.Enabled() {
-		serviceName = "cattle-cluster-agent"
-	}
+	serviceName := InternalServiceName()
 	service, err := h.services.Get(namespace.System, serviceName)
 	if err != nil {
 		return "", err
@@ -67,7 +80,7 @@ func (h *handler) getInternalServerAndURL() (string, string, error) {
 
 	clusterIPService := false
 	if features.MCMAgent.Enabled() {
-		if _, err := h.deploymentCache.Get(namespace.System, "cattle-cluster-agent"); err == nil {
+		if _, err := h.deploymentCache.Get(namespace.System, AgentServiceName); err == nil {
 			clusterIPService = true
 		}
 	} else {
